@@ -1,621 +1,1129 @@
-from typing import Annotated, Any, Dict, Sequence, TypedDict
-
+from typing import Annotated, Any, Dict, List, Sequence, TypedDict
+from datetime import datetime, timedelta
+import json
 import operator
+from dataclasses import dataclass
+from arch import arch_model
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai.chat_models import ChatOpenAI
 from langgraph.graph import END, StateGraph
-
-from src.tools import calculate_bollinger_bands, calculate_macd, calculate_obv, calculate_rsi, get_financial_metrics, get_insider_trades, get_prices, prices_to_df
-
-import argparse
-from datetime import datetime
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional
+import asyncio
+from datetime import datetime, timedelta
+import logging
 import json
+from tools import (
+    CryptoDataTools,
+    CryptoTechnicalAnalysis,
+    LiquidityAnalysis,
+    calculate_bollinger_bands,
+    calculate_macd,
+    calculate_obv,
+    calculate_rsi,
+    get_financial_metrics,
+    get_insider_trades,
+    get_prices,
+    prices_to_df
+)
 
-llm = ChatOpenAI(model="gpt-4o")
+# Initialize AI model
+llm = ChatOpenAI(model="gpt-4")
+data_tools = CryptoDataTools()
+tech_analysis = CryptoTechnicalAnalysis()
+liquidity_analysis = LiquidityAnalysis()
 
 def merge_dicts(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     return {**a, **b}
 
-# Define agent state
+@dataclass
+class TokenMetrics:
+    price: float
+    volume_24h: float
+    liquidity: float
+    holders: int
+    transactions_24h: int
+    market_cap: float
+    fully_diluted_val: float
+    circulating_supply: float
+    total_supply: float
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     data: Annotated[Dict[str, Any], merge_dicts]
     metadata: Annotated[Dict[str, Any], merge_dicts]
 
-##### Market Data Agent #####
-def market_data_agent(state: AgentState):
-    """Responsible for gathering and preprocessing market data"""
+async def market_data_agent(state: AgentState):
+    """Gathers and preprocesses crypto market data from multiple sources"""
     messages = state["messages"]
     data = state["data"]
 
     # Set default dates
-    end_date = data["end_date"] or datetime.now().strftime('%Y-%m-%d')
-    if not data["start_date"]:
-        # Calculate 3 months before end_date
-        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
-        start_date = end_date_obj.replace(month=end_date_obj.month - 3) if end_date_obj.month > 3 else \
-            end_date_obj.replace(year=end_date_obj.year - 1, month=end_date_obj.month + 9)
-        start_date = start_date.strftime('%Y-%m-%d')
+    end_date = data.get("end_date") or datetime.now()
+    if not data.get("start_date"):
+        start_date = end_date - timedelta(days=30)
     else:
-        start_date = data["start_date"]
+        start_date = datetime.strptime(data["start_date"], '%Y-%m-%d')
 
-    # Get the historical price data
-    prices = get_prices(
-        ticker=data["ticker"], 
-        start_date=start_date, 
-        end_date=end_date,
-    )
+    token_metrics = {}
+    historical_prices = {}
+    liquidity_data = {}
 
-    # Get the financial metrics
-    financial_metrics = get_financial_metrics(
-        ticker=data["ticker"], 
-        report_period=end_date, 
-        period='ttm', 
-        limit=1,
-    )
+    # Gather data for each trading pair
+    for token in data["trading_pairs"]:
+        # Get current metrics using Helius
+        metrics = await data_tools.get_token_metrics(token)
+        token_metrics[token] = TokenMetrics(
+            price=metrics.price,
+            volume_24h=metrics.volume,
+            liquidity=metrics.liquidity,
+            holders=metrics.holders,
+            transactions_24h=metrics.transactions,
+            market_cap=metrics.price * metrics.circulating_supply,
+            fully_diluted_val=metrics.price * metrics.total_supply,
+            circulating_supply=metrics.circulating_supply,
+            total_supply=metrics.total_supply
+        )
 
-    # Get the insider trades
-    insider_trades = get_insider_trades(
-        ticker=data["ticker"], 
-        start_date=start_date, 
-        end_date=end_date,
-    )
+        # Get historical price data from Jupiter
+        historical_prices[token] = await data_tools.get_historical_prices(
+            token,
+            start_date=start_date,
+            end_date=end_date
+        )
 
+        # Get liquidity pool data from Orca/Meteora
+        liquidity_data[token] = await liquidity_analysis.analyze_pool_depth(
+            token,
+            "USDC",
+            token
+        )
+
+        # Get financial metrics
+        financial_metrics = await get_financial_metrics(token)
+        token_metrics[token].update(financial_metrics)
+
+        # Get insider trades
+        insider_trades = await get_insider_trades(token)
+        token_metrics[token].update(insider_trades)
+
+        # Get prices and convert to DataFrame
+        prices = await get_prices(token)
+        prices_df = prices_to_df(prices)
+        historical_prices[token] = prices_df
+
+    # Get on-chain metrics using Helius
+    onchain_metrics = {
+        token: await data_tools.get_token_on_chain_metrics(token)
+        for token in data["trading_pairs"]
+    }
 
     return {
         "messages": messages,
         "data": {
-            **data, 
-            "prices": prices, 
-            "start_date": start_date, 
-            "end_date": end_date,
-            "financial_metrics": financial_metrics,
-            "insider_trades": insider_trades,
+            **data,
+            "token_metrics": token_metrics,
+            "historical_prices": historical_prices,
+            "liquidity_data": liquidity_data,
+            "onchain_metrics": onchain_metrics,
+            "start_date": start_date,
+            "end_date": end_date
         }
     }
 
-##### Quantitative Agent #####
-def quant_agent(state: AgentState):
-    """Analyzes technical indicators and generates trading signals."""
+def show_agent_reasoning(output: Dict[str, Any], agent_name: str):
+    """Display agent's reasoning in a formatted way"""
+    print(f"\n{'=' * 10} {agent_name.center(28)} {'=' * 10}")
+    if isinstance(output, (dict, list)):
+        print(json.dumps(output, indent=2))
+    else:
+        try:
+            parsed_output = json.loads(output)
+            print(json.dumps(parsed_output, indent=2))
+        except json.JSONDecodeError:
+            print(output)
+    print("=" * 48)
+
+# Initialize core components
+async def initialize_trading_environment(
+    trading_pairs: List[str],
+    initial_portfolio: Dict[str, float]
+) -> Dict[str, Any]:
+    """Initialize the trading environment with necessary components"""
+    return {
+        "trading_pairs": trading_pairs,
+        "portfolio": initial_portfolio,
+        "data_tools": data_tools,
+        "tech_analysis": tech_analysis,
+        "liquidity_analysis": liquidity_analysis
+    }
+async def quant_agent(state: AgentState):
+    """Analyzes technical indicators and on-chain metrics for trading signals."""
     show_reasoning = state["metadata"]["show_reasoning"]
-
     data = state["data"]
-    prices = data["prices"]
-    prices_df = prices_to_df(prices)
-    
-    # Calculate indicators
-    # 1. MACD (Moving Average Convergence Divergence)
-    macd_line, signal_line = calculate_macd(prices_df)
-    
-    # 2. RSI (Relative Strength Index)
-    rsi = calculate_rsi(prices_df)
-    
-    # 3. Bollinger Bands (Bollinger Bands)
-    upper_band, lower_band = calculate_bollinger_bands(prices_df)
-    
-    # 4. OBV (On-Balance Volume)
-    obv = calculate_obv(prices_df)
-    
-    # Generate individual signals
-    signals = []
-    
-    # MACD signal
-    if macd_line.iloc[-2] < signal_line.iloc[-2] and macd_line.iloc[-1] > signal_line.iloc[-1]:
-        signals.append('bullish')
-    elif macd_line.iloc[-2] > signal_line.iloc[-2] and macd_line.iloc[-1] < signal_line.iloc[-1]:
-        signals.append('bearish')
-    else:
-        signals.append('neutral')
-    
-    # RSI signal
-    if rsi.iloc[-1] < 30:
-        signals.append('bullish')
-    elif rsi.iloc[-1] > 70:
-        signals.append('bearish')
-    else:
-        signals.append('neutral')
-    
-    # Bollinger Bands signal
-    current_price = prices_df['close'].iloc[-1]
-    if current_price < lower_band.iloc[-1]:
-        signals.append('bullish')
-    elif current_price > upper_band.iloc[-1]:
-        signals.append('bearish')
-    else:
-        signals.append('neutral')
-    
-    # OBV signal
-    obv_slope = obv.diff().iloc[-5:].mean()
-    if obv_slope > 0:
-        signals.append('bullish')
-    elif obv_slope < 0:
-        signals.append('bearish')
-    else:
-        signals.append('neutral')
-    
-    # Add reasoning collection
-    reasoning = {
-        "MACD": {
-            "signal": signals[0],
-            "details": f"MACD Line crossed {'above' if signals[0] == 'bullish' else 'below' if signals[0] == 'bearish' else 'neither above nor below'} Signal Line"
-        },
-        "RSI": {
-            "signal": signals[1],
-            "details": f"RSI is {rsi.iloc[-1]:.2f} ({'oversold' if signals[1] == 'bullish' else 'overbought' if signals[1] == 'bearish' else 'neutral'})"
-        },
-        "Bollinger": {
-            "signal": signals[2],
-            "details": f"Price is {'below lower band' if signals[2] == 'bullish' else 'above upper band' if signals[2] == 'bearish' else 'within bands'}"
-        },
-        "OBV": {
-            "signal": signals[3],
-            "details": f"OBV slope is {obv_slope:.2f} ({signals[3]})"
-        }
-    }
-    
-    # Determine overall signal
-    bullish_signals = signals.count('bullish')
-    bearish_signals = signals.count('bearish')
-    
-    if bullish_signals > bearish_signals:
-        overall_signal = 'bullish'
-    elif bearish_signals > bullish_signals:
-        overall_signal = 'bearish'
-    else:
-        overall_signal = 'neutral'
-    
-    # Calculate confidence level based on the proportion of indicators agreeing
-    total_signals = len(signals)
-    confidence = max(bullish_signals, bearish_signals) / total_signals
-    
-    # Generate the message content
+
+    # Initialize signals dictionary for each trading pair
+    signals = {}
+    reasoning = {}
+
+    for token in data["trading_pairs"]:
+        prices_df = data["historical_prices"][token]
+        metrics = data["token_metrics"][token]
+        liquidity = data["liquidity_data"][token]
+        onchain = data["onchain_metrics"][token]
+
+        # Calculate technical indicators
+        technical_signals = await calculate_technical_signals(
+            prices_df=prices_df,
+            token_metrics=metrics
+        )
+
+        # Calculate on-chain signals
+        onchain_signals = await calculate_onchain_signals(
+            onchain_metrics=onchain,
+            token_metrics=metrics
+        )
+
+        # Calculate liquidity signals
+        liquidity_signals = await calculate_liquidity_signals(
+            liquidity_data=liquidity,
+            token_metrics=metrics
+        )
+
+        # Combine all signals for final analysis
+        token_analysis = combine_signals(
+            technical=technical_signals,
+            onchain=onchain_signals,
+            liquidity=liquidity_signals
+        )
+
+        signals[token] = token_analysis["signal"]
+        reasoning[token] = token_analysis["reasoning"]
+
     message_content = {
-        "signal": overall_signal,
-        "confidence": round(confidence, 2),
-        "reasoning": {
-            "MACD": reasoning["MACD"],
-            "RSI": reasoning["RSI"],
-            "Bollinger": reasoning["Bollinger"],
-            "OBV": reasoning["OBV"]
-        }
+        "signals": signals,
+        "reasoning": reasoning,
+        "timestamp": datetime.now().isoformat()
     }
 
-    # Create the quant message
-    message = HumanMessage(
-        content=str(message_content),  # Convert dict to string for message content
-        name="quant_agent",
-    )
-
-    # Print the reasoning if the flag is set
     if show_reasoning:
         show_agent_reasoning(message_content, "Quant Agent")
-    
+
     return {
-        "messages": [message],
+        "messages": [HumanMessage(content=str(message_content), name="quant_agent")],
         "data": data,
     }
 
-##### Fundamental Agent #####
-def fundamentals_agent(state: AgentState):
-    """Analyzes fundamental data and generates trading signals."""
-    show_reasoning = state["metadata"]["show_reasoning"]
-    data = state["data"]
-    metrics = data["financial_metrics"][0]  # Get the most recent metrics
+async def calculate_technical_signals(
+    prices_df: pd.DataFrame,
+    token_metrics: TokenMetrics
+) -> Dict[str, Any]:
+    """Calculate technical analysis signals for crypto."""
     
-    # Initialize signals list for different fundamental aspects
+    # Price action analysis
+    sma_20 = prices_df['close'].rolling(window=20).mean()
+    sma_50 = prices_df['close'].rolling(window=50).mean()
+    ema_12 = prices_df['close'].ewm(span=12, adjust=False).mean()
+    ema_26 = prices_df['close'].ewm(span=26, adjust=False).mean()
+    
+    # Volume analysis
+    volume_sma = prices_df['volume'].rolling(window=20).mean()
+    current_volume = prices_df['volume'].iloc[-1]
+    
+    # Momentum indicators
+    rsi = calculate_rsi(prices_df, period=14)
+    macd, macd_signal = calculate_macd(prices_df)
+    obv = calculate_obv(prices_df)
+    
+    # Volatility analysis
+    atr = tech_analysis.calculate_atr(prices_df, period=14)
+    bollinger = calculate_bollinger_bands(prices_df)
+
+    current_price = prices_df['close'].iloc[-1]
     signals = []
-    reasoning = {}
-    
-    # 1. Profitability Analysis
-    profitability_score = 0
-    if metrics["return_on_equity"] > 0.15:  # Strong ROE above 15%
-        profitability_score += 1
-    if metrics["net_margin"] > 0.20:  # Healthy profit margins
-        profitability_score += 1
-    if metrics["operating_margin"] > 0.15:  # Strong operating efficiency
-        profitability_score += 1
-        
-    signals.append('bullish' if profitability_score >= 2 else 'bearish' if profitability_score == 0 else 'neutral')
-    reasoning["Profitability"] = {
-        "signal": signals[0],
-        "details": f"ROE: {metrics['return_on_equity']:.2%}, Net Margin: {metrics['net_margin']:.2%}, Op Margin: {metrics['operating_margin']:.2%}"
+    details = {}
+
+    # Trend analysis
+    if current_price > sma_20.iloc[-1] and sma_20.iloc[-1] > sma_50.iloc[-1]:
+        signals.append('bullish')
+        details['trend'] = 'Upward trend: Price above both SMAs'
+    elif current_price < sma_20.iloc[-1] and sma_20.iloc[-1] < sma_50.iloc[-1]:
+        signals.append('bearish')
+        details['trend'] = 'Downward trend: Price below both SMAs'
+    else:
+        signals.append('neutral')
+        details['trend'] = 'No clear trend'
+
+    # Volume analysis
+    if current_volume > volume_sma.iloc[-1] * 1.5:
+        signals.append('bullish')
+        details['volume'] = 'High volume: Above average'
+    elif current_volume < volume_sma.iloc[-1] * 0.5:
+        signals.append('bearish')
+        details['volume'] = 'Low volume: Below average'
+    else:
+        signals.append('neutral')
+        details['volume'] = 'Normal volume levels'
+
+    # Momentum analysis
+    if rsi.iloc[-1] < 30:
+        signals.append('bullish')
+        details['momentum'] = 'Oversold: RSI below 30'
+    elif rsi.iloc[-1] > 70:
+        signals.append('bearish')
+        details['momentum'] = 'Overbought: RSI above 70'
+    else:
+        signals.append('neutral')
+        details['momentum'] = 'Normal momentum'
+
+    # OBV analysis
+    if obv.iloc[-1] > obv.mean():
+        signals.append('bullish')
+        details['obv'] = 'Positive OBV trend'
+    else:
+        signals.append('neutral')
+        details['obv'] = 'Neutral OBV trend'
+
+    return {
+        "signals": signals,
+        "details": details
     }
+
+async def calculate_onchain_signals(
+    onchain_metrics: Dict[str, Any],
+    token_metrics: TokenMetrics
+) -> Dict[str, Any]:
+    """Analyze on-chain metrics for trading signals."""
     
-    # 2. Growth Analysis
-    growth_score = 0
-    if metrics["revenue_growth"] > 0.10:  # 10% revenue growth
-        growth_score += 1
-    if metrics["earnings_growth"] > 0.10:  # 10% earnings growth
-        growth_score += 1
-    if metrics["book_value_growth"] > 0.10:  # 10% book value growth
-        growth_score += 1
-        
-    signals.append('bullish' if growth_score >= 2 else 'bearish' if growth_score == 0 else 'neutral')
-    reasoning["Growth"] = {
-        "signal": signals[1],
-        "details": f"Revenue Growth: {metrics['revenue_growth']:.2%}, Earnings Growth: {metrics['earnings_growth']:.2%}"
+    signals = []
+    details = {}
+
+    # Holder analysis
+    holder_change = onchain_metrics['holder_change_24h']
+    if holder_change > 0.05:  # 5% increase in holders
+        signals.append('bullish')
+        details['holders'] = f'Strong holder growth: {holder_change:.1%} increase'
+    elif holder_change < -0.05:
+        signals.append('bearish')
+        details['holders'] = f'Holder decline: {holder_change:.1%} decrease'
+    else:
+        signals.append('neutral')
+        details['holders'] = 'Stable holder base'
+
+    # Transaction analysis
+    tx_volume = onchain_metrics['transaction_volume_24h']
+    avg_tx_volume = onchain_metrics['avg_transaction_volume_7d']
+    if tx_volume > avg_tx_volume * 1.5:
+        signals.append('bullish')
+        details['transactions'] = 'High transaction activity'
+    elif tx_volume < avg_tx_volume * 0.5:
+        signals.append('bearish')
+        details['transactions'] = 'Low transaction activity'
+    else:
+        signals.append('neutral')
+        details['transactions'] = 'Normal transaction activity'
+
+    # Whale analysis
+    whale_accumulation = onchain_metrics['whale_accumulation_24h']
+    if whale_accumulation > 0:
+        signals.append('bullish')
+        details['whales'] = 'Whales accumulating'
+    elif whale_accumulation < 0:
+        signals.append('bearish')
+        details['whales'] = 'Whales distributing'
+    else:
+        signals.append('neutral')
+        details['whales'] = 'No significant whale activity'
+
+    return {
+        "signals": signals,
+        "details": details
     }
+
+async def calculate_liquidity_signals(
+    liquidity_data: Dict[str, Any],
+    token_metrics: TokenMetrics
+) -> Dict[str, Any]:
+    """Analyze DEX liquidity metrics for trading signals."""
     
-    # 3. Financial Health
-    health_score = 0
-    if metrics["current_ratio"] > 1.5:  # Strong liquidity
-        health_score += 1
-    if metrics["debt_to_equity"] < 0.5:  # Conservative debt levels
-        health_score += 1
-    if metrics["free_cash_flow_per_share"] > metrics["earnings_per_share"] * 0.8:  # Strong FCF conversion
-        health_score += 1
-        
-    signals.append('bullish' if health_score >= 2 else 'bearish' if health_score == 0 else 'neutral')
-    reasoning["Financial_Health"] = {
-        "signal": signals[2],
-        "details": f"Current Ratio: {metrics['current_ratio']:.2f}, D/E: {metrics['debt_to_equity']:.2f}"
+    signals = []
+    details = {}
+
+    # Liquidity depth analysis
+    depth_ratio = liquidity_data['depth_2percent'] / token_metrics.volume_24h
+    if depth_ratio > 0.3:
+        signals.append('bullish')
+        details['liquidity'] = 'Deep liquidity relative to volume'
+    elif depth_ratio < 0.1:
+        signals.append('bearish')
+        details['liquidity'] = 'Shallow liquidity relative to volume'
+    else:
+        signals.append('neutral')
+        details['liquidity'] = 'Adequate liquidity'
+
+    # Liquidity concentration
+    concentration = liquidity_data['concentration_score']
+    if concentration < 0.3:
+        signals.append('bullish')
+        details['concentration'] = 'Well-distributed liquidity'
+    elif concentration > 0.7:
+        signals.append('bearish')
+        details['concentration'] = 'Highly concentrated liquidity'
+    else:
+        signals.append('neutral')
+        details['concentration'] = 'Moderate liquidity concentration'
+
+    # Impermanent loss risk
+    il_risk = liquidity_data['impermanent_loss_risk']
+    if il_risk < 0.1:
+        signals.append('bullish')
+        details['il_risk'] = 'Low impermanent loss risk'
+    elif il_risk > 0.3:
+        signals.append('bearish')
+        details['il_risk'] = 'High impermanent loss risk'
+    else:
+        signals.append('neutral')
+        details['il_risk'] = 'Moderate impermanent loss risk'
+
+    return {
+        "signals": signals,
+        "details": details
     }
+
+def combine_signals(
+    technical: Dict[str, Any],
+    onchain: Dict[str, Any],
+    liquidity: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Combine different signal types into overall trading signal."""
     
-    # 4. Valuation
-    pe_ratio = metrics["price_to_earnings_ratio"]
-    pb_ratio = metrics["price_to_book_ratio"]
-    ps_ratio = metrics["price_to_sales_ratio"]
+    all_signals = (
+        technical["signals"] +
+        onchain["signals"] +
+        liquidity["signals"]
+    )
     
-    valuation_score = 0
-    if pe_ratio < 25:  # Reasonable P/E ratio
-        valuation_score += 1
-    if pb_ratio < 3:  # Reasonable P/B ratio
-        valuation_score += 1
-    if ps_ratio < 5:  # Reasonable P/S ratio
-        valuation_score += 1
-        
-    signals.append('bullish' if valuation_score >= 2 else 'bearish' if valuation_score == 0 else 'neutral')
-    reasoning["Valuation"] = {
-        "signal": signals[3],
-        "details": f"P/E: {pe_ratio:.2f}, P/B: {pb_ratio:.2f}, P/S: {ps_ratio:.2f}"
-    }
-    
-    # Determine overall signal
-    bullish_signals = signals.count('bullish')
-    bearish_signals = signals.count('bearish')
-    
-    if bullish_signals > bearish_signals:
+    bullish_count = all_signals.count('bullish')
+    bearish_count = all_signals.count('bearish')
+    total_signals = len(all_signals)
+
+    # Calculate overall signal
+    if bullish_count > bearish_count:
         overall_signal = 'bullish'
-    elif bearish_signals > bullish_signals:
+        confidence = bullish_count / total_signals
+    elif bearish_count > bullish_count:
         overall_signal = 'bearish'
+        confidence = bearish_count / total_signals
     else:
         overall_signal = 'neutral'
-    
-    # Calculate confidence level
-    total_signals = len(signals)
-    confidence = max(bullish_signals, bearish_signals) / total_signals
-    
-    message_content = {
-        "signal": overall_signal,
-        "confidence": round(confidence, 2),
-        "reasoning": reasoning
-    }
-    
-    # Create the fundamental analysis message
-    message = HumanMessage(
-        content=str(message_content),
-        name="fundamentals_agent",
-    )
-    
-    # Print the reasoning if the flag is set
-    if show_reasoning:
-        show_agent_reasoning(message_content, "Fundamental Analysis Agent")
-    
-    return {
-        "messages": [message],
-        "data": data,
-    }
+        confidence = 0.5
 
-##### Sentiment Agent #####
-def sentiment_agent(state: AgentState):
-    """Analyzes market sentiment and generates trading signals."""
+    return {
+        "signal": overall_signal,
+        "confidence": confidence,
+        "reasoning": {
+            "technical": technical["details"],
+            "onchain": onchain["details"],
+            "liquidity": liquidity["details"]
+        }
+    }
+async def sentiment_agent(state: AgentState):
+    """Analyzes market sentiment from social media, news, and on-chain metrics."""
     data = state["data"]
-    insider_trades = data["insider_trades"]
     show_reasoning = state["metadata"]["show_reasoning"]
 
-    # Create the prompt template
-    template = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """
-                You are a market sentiment analyst.
-                Your job is to analyze the insider trades of a company and provide a sentiment analysis.
-                The insider trades are a list of transactions made by company insiders.
-                - If the insider is buying, the sentiment may be bullish. 
-                - If the insider is selling, the sentiment may be bearish.
-                - If the insider is neutral, the sentiment may be neutral.
-                The sentiment is amplified if the insider is buying or selling a large amount of shares.
-                Also, the sentiment is amplified if the insider is a high-level executive (e.g. CEO, CFO, etc.) or board member.
-                For each insider trade, provide the following in your output (as a JSON):
-                "sentiment": <bullish | bearish | neutral>,
-                "reasoning": <concise explanation of the decision>
-                """
-            ),
-            (
-                "human",
-                """
-                Based on the following insider trades, provide your sentiment analysis.
-                {insider_trades}
+    template = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """You are a crypto market sentiment analyst specializing in social and on-chain metrics.
+            Analyze the following data points to determine market sentiment:
+            - Social media engagement and sentiment
+            - On-chain activity patterns
+            - Whale wallet movements
+            - Developer activity
+            - Market maker behavior
+            
+            Provide your analysis in JSON format with:
+            {
+                "sentiment": "bullish" | "bearish" | "neutral",
+                "confidence": <float between 0 and 1>,
+                "reasoning": {
+                    "social": <social media analysis>,
+                    "onchain": <on-chain behavior analysis>,
+                    "development": <developer activity analysis>,
+                    "market_making": <market maker behavior analysis>
+                }
+            }"""
+        ),
+        (
+            "human",
+            """Analyze the sentiment for these tokens based on the provided metrics:
+            Token Metrics: {token_metrics}
+            On-chain Data: {onchain_data}
+            Social Metrics: {social_metrics}
+            """
+        ),
+    ])
 
-                Only include the sentiment and reasoning in your JSON output.  Do not include any JSON markdown.
-                """
-            ),
-        ]
-    )
+    token_sentiments = {}
+    
+    for token in data["trading_pairs"]:
+        # Gather sentiment data points
+        social_metrics = await data_tools.get_social_metrics(token)
+        github_activity = await data_tools.get_developer_activity(token)
+        whale_activity = data["onchain_metrics"][token]["whale_movements"]
+        
+        prompt = template.invoke({
+            "token_metrics": json.dumps(data["token_metrics"][token].__dict__),
+            "onchain_data": json.dumps({
+                "whale_activity": whale_activity,
+                "developer_activity": github_activity
+            }),
+            "social_metrics": json.dumps(social_metrics)
+        })
+        
+        result = await llm.ainvoke(prompt)
+        token_sentiments[token] = json.loads(result.content)
 
-    # Generate the prompt
-    prompt = template.invoke(
-        {"insider_trades": insider_trades}
-    )
+    message_content = {
+        "sentiments": token_sentiments,
+        "timestamp": datetime.now().isoformat()
+    }
 
-    # Invoke the LLM
-    result = llm.invoke(prompt)
-
-    # Extract the sentiment and reasoning from the result, safely
-    try:
-        message_content = json.loads(result.content)
-    except json.JSONDecodeError:
-        message_content = {"sentiment": "neutral", "reasoning": "Unable to parse JSON output of market sentiment analysis"}
-
-    # Create the market sentiment message
-    message = HumanMessage(
-        content=str(message_content),
-        name="sentiment_agent",
-    )
-
-    # Print the reasoning if the flag is set
     if show_reasoning:
         show_agent_reasoning(message_content, "Sentiment Analysis Agent")
 
     return {
-        "messages": [message],
-        "data": data,
+        "messages": [HumanMessage(content=str(message_content), name="sentiment_agent")],
+        "data": data
     }
 
-##### Risk Management Agent #####
-def risk_management_agent(state: AgentState):
-    """Evaluates portfolio risk and sets position limits"""
+async def risk_management_agent(state: AgentState):
+    """Evaluates portfolio risk and sets position limits for crypto assets."""
+    data = state["data"]
     show_reasoning = state["metadata"]["show_reasoning"]
-    portfolio = state["data"]["portfolio"]
+    portfolio = data["portfolio"]
+
+    # Get messages from previous agents
+    quant_message = next(msg for msg in state["messages"] if msg.name == "quant_agent")
+    sentiment_message = next(msg for msg in state["messages"] if msg.name == "sentiment_agent")
+
+    risk_assessments = {}
     
-    # Find the quant message by looking for the message with name "quant_agent"
-    quant_message = next(msg for msg in state["messages"] if msg.name == "quant_agent")
-    fundamentals_message = next(msg for msg in state["messages"] if msg.name == "fundamentals_agent")
-    sentiment_message = next(msg for msg in state["messages"] if msg.name == "sentiment_agent")
-    # Create the prompt template
-    template = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """You are a risk management specialist.
-                Your job is to take a look at the trading analysis and
-                evaluate portfolio exposure and recommend position sizing.
-                Provide the following in your output (as a JSON):
-                "max_position_size": <float greater than 0>,
-                "risk_score": <integer between 1 and 10>,
-                "trading_action": <buy | sell | hold>,
-                "reasoning": <concise explanation of the decision>
-                """
+    for token in data["trading_pairs"]:
+        # Calculate risk metrics
+        volatility = calculate_token_volatility(data["historical_prices"][token])
+        liquidity_risk = assess_liquidity_risk(data["liquidity_data"][token])
+        correlation_risk = calculate_correlation_risk(
+            data["historical_prices"],
+            token,
+            portfolio["tokens"]
+        )
+        #smart_contract_risk = assess_smart_contract_risk(token)
+        
+        # Determine position limits
+        max_position = calculate_position_limit(
+            token=token,
+            portfolio_value=calculate_portfolio_value(portfolio, data["token_metrics"]),
+            volatility=volatility,
+            liquidity=data["liquidity_data"][token],
+            correlation=correlation_risk
+        )
+        
+        risk_assessments[token] = {
+            "risk_score": calculate_risk_score(
+                volatility,
+                liquidity_risk,
+                correlation_risk,
+                #smart_contract_risk
             ),
-            (
-                "human",
-                """Based on the trading analysis below, provide your risk assessment.
-
-                Quant Analysis Trading Signal: {quant_message}
-                Fundamental Analysis Trading Signal: {fundamentals_message}
-                Sentiment Analysis Trading Signal: {sentiment_message}
-                Here is the current portfolio:
-                Portfolio:
-                Cash: {portfolio_cash}
-                Current Position: {portfolio_stock} shares
-                
-                Only include the max position size, risk score, trading action, and reasoning in your JSON output.  Do not include any JSON markdown.
-                """
-            ),
-        ]
-    )
-
-    # Generate the prompt
-    prompt = template.invoke(
-        {
-            "quant_message": quant_message.content,
-            "fundamentals_message": fundamentals_message.content,
-            "sentiment_message": sentiment_message.content,
-            "portfolio_cash": f"{portfolio['cash']:.2f}",
-            "portfolio_stock": portfolio["stock"],
-        }
-    )
-
-    # Invoke the LLM
-    result = llm.invoke(prompt)
-    message = HumanMessage(
-        content=result.content,
-        name="risk_management_agent",
-    )
-
-    # Print the decision if the flag is set
-    if show_reasoning:
-        show_agent_reasoning(message.content, "Risk Management Agent")
-
-    return {"messages": state["messages"] + [message]}
-
-
-##### Portfolio Management Agent #####
-def portfolio_management_agent(state: AgentState):
-    """Makes final trading decisions and generates orders"""
-    show_reasoning = state["metadata"]["show_reasoning"]
-    portfolio = state["data"]["portfolio"]
-
-    # Get the quant agent, fundamentals agent, and risk management agent messages
-    quant_message = next(msg for msg in state["messages"] if msg.name == "quant_agent")
-    fundamentals_message = next(msg for msg in state["messages"] if msg.name == "fundamentals_agent")
-    sentiment_message = next(msg for msg in state["messages"] if msg.name == "sentiment_agent")
-    risk_message = next(msg for msg in state["messages"] if msg.name == "risk_management_agent")
-
-    # Create the prompt template
-    template = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """You are a portfolio manager making final trading decisions.
-                Your job is to make a trading decision based on the team's analysis.
-                Provide the following in your output:
-                - "action": "buy" | "sell" | "hold",
-                - "quantity": <positive integer>
-                - "reasoning": <concise explanation of the decision>
-                Only buy if you have available cash.
-                The quantity that you buy must be less than or equal to the max position size.
-                Only sell if you have shares in the portfolio to sell.
-                The quantity that you sell must be less than or equal to the current position."""
-            ),
-            (
-                "human",
-                """Based on the team's analysis below, make your trading decision.
-
-                Quant Analysis Trading Signal: {quant_message}
-                Fundamental Analysis Trading Signal: {fundamentals_message}
-                Sentiment Analysis Trading Signal: {sentiment_message}
-                Risk Management Trading Signal: {risk_message}
-
-                Here is the current portfolio:
-                Portfolio:
-                Cash: {portfolio_cash}
-                Current Position: {portfolio_stock} shares
-
-                Only include the action, quantity, and reasoning in your output as JSON.  Do not include any JSON markdown.
-
-                Remember, the action must be either buy, sell, or hold.
-                You can only buy if you have available cash.
-                You can only sell if you have shares in the portfolio to sell.
-                """
-            ),
-        ]
-    )
-
-    # Generate the prompt
-    prompt = template.invoke(
-        {
-            "quant_message": quant_message.content, 
-            "fundamentals_message": fundamentals_message.content,
-            "sentiment_message": sentiment_message.content,
-            "risk_message": risk_message.content,
-            "portfolio_cash": f"{portfolio['cash']:.2f}",
-            "portfolio_stock": portfolio["stock"]
-        }
-    )
-    # Invoke the LLM
-    result = llm.invoke(prompt)
-
-    # Create the portfolio management message
-    message = HumanMessage(
-        content=result.content,
-        name="portfolio_management",
-    )
-
-    # Print the decision if the flag is set
-    if show_reasoning:
-        show_agent_reasoning(message.content, "Portfolio Management Agent")
-
-    return {"messages": state["messages"] + [message]}
-
-def show_agent_reasoning(output, agent_name):
-    print(f"\n{'=' * 10} {agent_name.center(28)} {'=' * 10}")
-    if isinstance(output, (dict, list)):
-        # If output is already a dictionary or list, just pretty print it
-        print(json.dumps(output, indent=2))
-    else:
-        try:
-            # Parse the string as JSON and pretty print it
-            parsed_output = json.loads(output)
-            print(json.dumps(parsed_output, indent=2))
-        except json.JSONDecodeError:
-            # Fallback to original string if not valid JSON
-            print(output)
-    print("=" * 48)
-
-##### Run the Hedge Fund #####
-def run_hedge_fund(ticker: str, start_date: str, end_date: str, portfolio: dict, show_reasoning: bool = False):
-    final_state = app.invoke(
-        {
-            "messages": [
-                HumanMessage(
-                    content="Make a trading decision based on the provided data.",
-                )
-            ],
-            "data": {
-                "ticker": ticker,
-                "portfolio": portfolio,
-                "start_date": start_date,
-                "end_date": end_date,
-            },
-            "metadata": {
-                "show_reasoning": show_reasoning,
+            "max_position_size": max_position,
+            "risk_factors": {
+                "volatility": volatility,
+                "liquidity_risk": liquidity_risk,
+                "correlation_risk": correlation_risk,
+                #"smart_contract_risk": smart_contract_risk
             }
-        },
+        }
+
+    message_content = {
+        "risk_assessments": risk_assessments,
+        "portfolio_recommendations": generate_portfolio_recommendations(
+            risk_assessments,
+            portfolio
+        )
+    }
+
+    if show_reasoning:
+        show_agent_reasoning(message_content, "Risk Management Agent")
+
+    return {
+        "messages": state["messages"] + [
+            HumanMessage(content=str(message_content), name="risk_management_agent")
+        ]
+    }
+
+async def portfolio_management_agent(state: AgentState):
+    """Makes final trading decisions considering all signals and risk parameters."""
+    data = state["data"]
+    show_reasoning = state["metadata"]["show_reasoning"]
+    portfolio = data["portfolio"]
+
+    # Collect all agent signals
+    quant_signals = json.loads(
+        next(msg for msg in state["messages"] if msg.name == "quant_agent").content
     )
-    return final_state["messages"][-1].content
+    sentiment_signals = json.loads(
+        next(msg for msg in state["messages"] if msg.name == "sentiment_agent").content
+    )
+    risk_assessment = json.loads(
+        next(msg for msg in state["messages"] if msg.name == "risk_management_agent").content
+    )
 
-# Define the new workflow
-workflow = StateGraph(AgentState)
-
-# Add nodes
-workflow.add_node("market_data_agent", market_data_agent)
-workflow.add_node("quant_agent", quant_agent)
-workflow.add_node("fundamentals_agent", fundamentals_agent)
-workflow.add_node("sentiment_agent", sentiment_agent)
-workflow.add_node("risk_management_agent", risk_management_agent)
-workflow.add_node("portfolio_management_agent", portfolio_management_agent)
-
-# Define the workflow
-workflow.set_entry_point("market_data_agent")
-workflow.add_edge("market_data_agent", "quant_agent")
-workflow.add_edge("market_data_agent", "fundamentals_agent")
-workflow.add_edge("market_data_agent", "sentiment_agent")
-workflow.add_edge("quant_agent", "risk_management_agent")
-workflow.add_edge("fundamentals_agent", "risk_management_agent")
-workflow.add_edge("sentiment_agent", "risk_management_agent")
-workflow.add_edge("risk_management_agent", "portfolio_management_agent")
-workflow.add_edge("portfolio_management_agent", END)
-
-app = workflow.compile()
-
-# Add this at the bottom of the file
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Run the hedge fund trading system')
-    parser.add_argument('--ticker', type=str, required=True, help='Stock ticker symbol')
-    parser.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD). Defaults to 3 months before end date')
-    parser.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD). Defaults to today')
-    parser.add_argument('--show-reasoning', action='store_true', help='Show reasoning from each agent')
+    trading_decisions = {}
     
-    args = parser.parse_args()
+    for token in data["trading_pairs"]:
+        # Generate optimal trade size
+        trade_size = calculate_optimal_trade_size(
+            token=token,
+            portfolio=portfolio,
+            signals=quant_signals["signals"][token],
+            sentiment=sentiment_signals["sentiments"][token],
+            risk_assessment=risk_assessment["risk_assessments"][token],
+            liquidity=data["liquidity_data"][token]
+        )
+        
+        # Determine best execution strategy
+        execution_strategy = determine_execution_strategy(
+            token=token,
+            trade_size=trade_size,
+            liquidity=data["liquidity_data"][token]
+        )
+        
+        trading_decisions[token] = {
+            "action": determine_trade_action(
+                quant_signals["signals"][token],
+                sentiment_signals["sentiments"][token],
+                risk_assessment["risk_assessments"][token]
+            ),
+            "quantity": trade_size,
+            "execution": execution_strategy,
+            "reasoning": compile_trading_reasoning(
+                token,
+                quant_signals,
+                sentiment_signals,
+                risk_assessment
+            )
+        }
+
+    message_content = {
+        "trading_decisions": trading_decisions,
+        "portfolio_update": calculate_expected_portfolio(
+            portfolio,
+            trading_decisions,
+            data["token_metrics"]
+        )
+    }
+
+    if show_reasoning:
+        show_agent_reasoning(message_content, "Portfolio Management Agent")
+
+    return {
+        "messages": state["messages"] + [
+            HumanMessage(content=str(message_content), name="portfolio_management")
+        ]
+    }
+
+def determine_trade_action(
+    quant_signal: str,
+    sentiment: Dict[str, Any],
+    risk_assessment: Dict[str, Any]
+) -> str:
+    """Determine the trade action based on signals, sentiment, and risk assessment."""
+    if quant_signal == "bullish" and sentiment["sentiment"] == "bullish":
+        return "buy"
+    elif quant_signal == "bearish" and sentiment["sentiment"] == "bearish":
+        return "sell"
+    else:
+        return "hold"
+
+def calculate_execution_duration(self, trade_size: float, liquidity: Dict[str, Any]) -> float:
+    """Calculate the duration for trade execution based on trade size and liquidity."""
+    base_duration = 1  # Base duration in hours
+    liquidity_factor = liquidity["depth_2percent"] / trade_size
+    return base_duration / liquidity_factor
+
+def compile_trading_reasoning(
+    token: str,
+    quant_signals: Dict[str, Any],
+    sentiment_signals: Dict[str, Any],
+    risk_assessment: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Compile reasoning for trading decisions."""
+    return {
+        "quant_signals": quant_signals["signals"][token],
+        "sentiment_signals": sentiment_signals["sentiments"][token],
+        "risk_assessment": risk_assessment["risk_assessments"][token]
+    }
+
+def calculate_portfolio_value(portfolio: Dict[str, Any], token_metrics: Dict[str, TokenMetrics]) -> float:
+    """Calculate the total value of the portfolio."""
+    total_value = portfolio["cash"]
+    for token, quantity in portfolio["tokens"].items():
+        if quantity > 0:
+            total_value += quantity * token_metrics[token].price
+    return total_value
+
+# Helper functions for risk and portfolio management
+
+def calculate_parkinson_volatility(price_history: pd.DataFrame) -> float:
+    """Calculate Parkinson volatility for a given price history."""
+    log_high_low = np.log(price_history['high'] / price_history['low'])
+    return np.sqrt((1 / (4 * len(log_high_low) * np.log(2))) * np.sum(log_high_low ** 2))
+def calculate_garch_volatility(returns: pd.Series) -> float:
+    """Calculate GARCH volatility for a given series of returns."""
     
-    # Validate dates if provided
-    if args.start_date:
-        try:
-            datetime.strptime(args.start_date, '%Y-%m-%d')
-        except ValueError:
-            raise ValueError("Start date must be in YYYY-MM-DD format")
+    model = arch_model(returns, vol='Garch', p=1, q=1)
+    model_fit = model.fit(disp='off')
+    return model_fit.conditional_volatility[-1]
+
+def calculate_position_limit(
+    token: str,
+    portfolio_value: float,
+    volatility: Dict[str, float],
+    liquidity: Dict[str, Any],
+    correlation: float
+) -> float:
+    """Calculate the maximum position limit for a token."""
+    base_limit = portfolio_value * 0.1  # 10% of portfolio value
+    volatility_adjustment = 1 / (1 + volatility["daily_vol"])
+    liquidity_adjustment = liquidity["depth_2percent"] / 100000
+    correlation_adjustment = 1 / (1 + correlation)
     
-    if args.end_date:
-        try:
-            datetime.strptime(args.end_date, '%Y-%m-%d')
-        except ValueError:
-            raise ValueError("End date must be in YYYY-MM-DD format")
+    return base_limit * volatility_adjustment * liquidity_adjustment * correlation_adjustment
+    return {
+        "daily_vol": returns.std() * np.sqrt(24),
+        "parkinson_vol": calculate_parkinson_volatility(price_history),
+        "garch_vol": calculate_garch_volatility(returns)
+    }
+
+def calculate_token_volatility(price_history: pd.DataFrame) -> Dict[str, float]:
+    """Calculate token volatility using advanced metrics."""
+    returns = price_history['close'].pct_change().dropna()
+    return {
+        "daily_vol": returns.std() * np.sqrt(24),
+        "parkinson_vol": calculate_parkinson_volatility(price_history),
+        "garch_vol": calculate_garch_volatility(returns)
+    }
+
+def assess_liquidity_risk(liquidity_data: Dict[str, Any]) -> Dict[str, float]:
+    """Assess liquidity risk across multiple dimensions."""
+    return {
+        "depth_risk": 1 - min(1, liquidity_data['depth_2percent'] / 100000),
+        "concentration_risk": liquidity_data['concentration_score'],
+        "slippage_risk": 0.0  # Placeholder value, define estimate_slippage_risk function if needed
+    }
+
+def calculate_correlation_risk(
+    price_histories: Dict[str, pd.DataFrame],
+    token: str,
+    portfolio_holdings: Dict[str, float]
+) -> float:
+    """Calculate portfolio correlation risk for a token."""
+    correlations = {}
+    token_returns = price_histories[token]['close'].pct_change().dropna()
     
-    # Sample portfolio - you might want to make this configurable too
-    portfolio = {
-        "cash": 100000.0,  # $100,000 initial cash
-        "stock": 0         # No initial stock position
+    for other_token, holding in portfolio_holdings.items():
+        if other_token != token and holding > 0:
+            other_returns = price_histories[other_token]['close'].pct_change().dropna()
+            correlations[other_token] = token_returns.corr(other_returns)
+    
+    return np.mean(list(correlations.values())) if correlations else 0
+
+
+def calculate_risk_score(
+    volatility: Dict[str, float],
+    liquidity_risk: Dict[str, float],
+    correlation_risk: float,
+    smart_contract_risk: Dict[str, float]
+) -> float:
+    """Calculate overall risk score combining multiple risk factors."""
+    weights = {
+        "volatility": 0.3,
+        "liquidity": 0.3,
+        "correlation": 0.2,
+        "smart_contract": 0.2
     }
     
-    result = run_hedge_fund(
-        ticker=args.ticker,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        portfolio=portfolio,
+    vol_score = (volatility["daily_vol"] + volatility["parkinson_vol"]) / 2
+    liq_score = (liquidity_risk["depth_risk"] + liquidity_risk["concentration_risk"]) / 2
+    sc_score = (
+        smart_contract_risk["audit_score"] +
+        smart_contract_risk["code_quality"]
+    ) / 2
+    
+    return (
+        weights["volatility"] * vol_score +
+        weights["liquidity"] * liq_score +
+        weights["correlation"] * correlation_risk +
+        weights["smart_contract"] * sc_score
+    )
+
+def calculate_optimal_trade_size(
+    token: str,
+    portfolio: Dict[str, Any],
+    signals: Dict[str, Any],
+    sentiment: Dict[str, Any],
+    risk_assessment: Dict[str, Any],
+    liquidity: Dict[str, Any]
+) -> float:
+    """Calculate optimal trade size considering multiple factors."""
+    base_size = min(
+        risk_assessment["max_position_size"],
+        liquidity["depth_2percent"] * 0.1
+    )
+    
+    # Adjust size based on signals and sentiment
+    confidence = (
+        float(signals["confidence"]) +
+        float(sentiment["confidence"])
+    ) / 2
+    
+    return base_size * confidence
+
+def determine_execution_strategy(
+    token: str,
+    trade_size: float,
+    liquidity: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Determine best execution strategy for a trade."""
+    return {
+        "method": "jupiter" if trade_size < liquidity["depth_2percent"] * 0.05 else "twap",
+        "duration": calculate_execution_duration(trade_size, liquidity),
+        "splits": calculate_optimal_splits(trade_size, liquidity),
+        "routes": determine_optimal_routes(token, trade_size)
+    }
+
+def calculate_optimal_splits(trade_size: float, liquidity: Dict[str, Any]) -> List[float]:
+    """Calculate optimal splits for a trade based on liquidity."""
+    # Example implementation: split trade into equal parts
+    num_splits = max(1, int(trade_size / (liquidity["depth_2percent"] * 0.1)))
+    split_size = trade_size / num_splits
+    return [split_size] * num_splits
+
+def determine_optimal_routes(token: str, trade_size: float) -> List[Dict[str, Any]]:
+    """Determine optimal routes for a trade."""
+    # Example implementation: return a single route
+    return [{"token": token, "size": trade_size, "route": "default"}]
+
+class CryptoTradingSystem:
+    def __init__(
+        self,
+        trading_pairs: List[str],
+        initial_capital: float,
+        risk_parameters: Optional[Dict[str, float]] = None,
+        show_reasoning: bool = False
+    ):
+        self.trading_pairs = trading_pairs
+        self.initial_capital = initial_capital
+        self.show_reasoning = show_reasoning
+        
+        # Initialize default risk parameters if not provided
+        self.risk_parameters = risk_parameters or {
+            "max_position_size": 0.1,  # 10% of portfolio per position
+            "max_slippage": 0.02,      # 2% maximum slippage
+            "min_liquidity": 100000,   # Minimum liquidity requirement in USDC
+            "rebalance_threshold": 0.05 # 5% deviation triggers rebalance
+        }
+        
+        # Initialize components
+        self.workflow = self._initialize_workflow()
+        self.logger = self._setup_logger()
+        
+    def _initialize_workflow(self) -> StateGraph:
+        """Initialize the agent workflow graph."""
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("market_data_agent", market_data_agent)
+        workflow.add_node("quant_agent", quant_agent)
+        workflow.add_node("sentiment_agent", sentiment_agent)
+        workflow.add_node("risk_management_agent", risk_management_agent)
+        workflow.add_node("portfolio_management_agent", portfolio_management_agent)
+        
+        # Define workflow
+        workflow.set_entry_point("market_data_agent")
+        workflow.add_edge("market_data_agent", "quant_agent")
+        workflow.add_edge("market_data_agent", "sentiment_agent")
+        workflow.add_edge("quant_agent", "risk_management_agent")
+        workflow.add_edge("sentiment_agent", "risk_management_agent")
+        workflow.add_edge("risk_management_agent", "portfolio_management_agent")
+        workflow.add_edge("portfolio_management_agent", END)
+        
+        return workflow.compile()
+
+    def _setup_logger(self) -> logging.Logger:
+        """Set up logging configuration."""
+        logger = logging.getLogger("CryptoTrading")
+        logger.setLevel(logging.INFO)
+        
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        return logger
+
+    def compile_trading_reasoning(
+        self,
+        token: str,
+        quant_signals: Dict[str, Any],
+        sentiment_signals: Dict[str, Any],
+        risk_assessment: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Compile reasoning for trading decisions."""
+        return {
+            "quant_signals": quant_signals["signals"][token],
+            "sentiment_signals": sentiment_signals["sentiments"][token],
+            "risk_assessment": risk_assessment["risk_assessments"][token]
+        }
+
+    async def execute_trades(
+        self,
+        trading_decisions: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Execute trading decisions using Jupiter and track results."""
+        execution_results = {}
+        
+        for token, decision in trading_decisions.items():
+            try:
+                if decision["action"] in ["buy", "sell"]:
+                    # Prepare transaction parameters
+                    tx_params = await self._prepare_transaction(token, decision)
+                    
+                    # Execute trade through Jupiter
+                    result = await self._execute_jupiter_trade(tx_params)
+                    
+                    # Track execution results
+                    execution_results[token] = {
+                        "status": "success" if result["success"] else "failed",
+                        "txid": result.get("signature"),
+                        "executed_price": result.get("executed_price"),
+                        "slippage": result.get("slippage"),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+                    self.logger.info(
+                        f"Trade executed for {token}: {decision['action']} "
+                        f"{decision['quantity']} @ {result.get('executed_price')}"
+                    )
+                else:
+                    execution_results[token] = {
+                        "status": "skipped",
+                        "reason": "no action required",
+                        "timestamp": datetime.now().isoformat()
+                    }
+            
+            except Exception as e:
+                self.logger.error(f"Trade execution failed for {token}: {str(e)}")
+                execution_results[token] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        return execution_results
+
+    async def _prepare_transaction(
+        self,
+        token: str,
+        decision: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Prepare transaction parameters for Jupiter."""
+        # Get current market data
+        token_price = await self.data_tools.get_token_price(token)
+        
+        # Calculate optimal route
+        route = await self._find_optimal_route(
+            token=token,
+            amount=decision["quantity"],
+            side=decision["action"]
+        )
+        
+        return {
+            "token": token,
+            "action": decision["action"],
+            "quantity": decision["quantity"],
+            "route": route,
+            "max_slippage": self.risk_parameters["max_slippage"],
+            "execution_strategy": decision["execution"]
+        }
+
+    async def run_trading_cycle(self) -> Dict[str, Any]:
+        """Execute one complete trading cycle."""
+        try:
+            # Initialize state
+            initial_state = {
+                "messages": [],
+                "data": {
+                    "trading_pairs": self.trading_pairs,
+                    "portfolio": {
+                        "cash": self.initial_capital,
+                        "tokens": {pair: 0 for pair in self.trading_pairs}
+                    },
+                    "timestamp": datetime.now().isoformat()
+                },
+                "metadata": {
+                    "show_reasoning": self.show_reasoning,
+                    "risk_parameters": self.risk_parameters
+                }
+            }
+            
+            # Run agent workflow
+            final_state = await self.workflow.ainvoke(initial_state)
+            
+            # Extract trading decisions
+            trading_decisions = json.loads(
+                next(
+                    msg.content for msg in final_state["messages"]
+                    if msg.name == "portfolio_management"
+                )
+            )
+            
+            # Execute trades
+            execution_results = await self.execute_trades(
+                trading_decisions["trading_decisions"]
+            )
+            
+            # Update portfolio state
+            updated_portfolio = await self._update_portfolio_state(
+                execution_results
+            )
+            
+            return {
+                "trading_decisions": trading_decisions,
+                "execution_results": execution_results,
+                "updated_portfolio": updated_portfolio,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Trading cycle failed: {str(e)}")
+            raise
+
+    async def _update_portfolio_state(
+        self,
+        execution_results: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Update portfolio state after trade execution."""
+        portfolio = {
+            "cash": self.initial_capital,
+            "tokens": {pair: 0 for pair in self.trading_pairs},
+            "total_value": 0,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Update positions based on execution results
+        for token, result in execution_results.items():
+            if result["status"] == "success":
+                quantity = float(result["executed_quantity"])
+                price = float(result["executed_price"])
+                
+                if result.get("action") == "buy":
+                    portfolio["tokens"][token] += quantity
+                    portfolio["cash"] -= quantity * price
+                else:
+                    portfolio["tokens"][token] -= quantity
+                    portfolio["cash"] += quantity * price
+        
+        # Calculate total portfolio value
+        portfolio["total_value"] = portfolio["cash"]
+        for token, quantity in portfolio["tokens"].items():
+            if quantity > 0:
+                current_price = await self.data_tools.get_token_price(token)
+                portfolio["total_value"] += quantity * current_price
+        
+        return portfolio
+
+def calculate_expected_portfolio(
+    portfolio: Dict[str, Any],
+    trading_decisions: Dict[str, Any],
+    token_metrics: Dict[str, TokenMetrics]
+) -> Dict[str, Any]:
+    """Calculate the expected portfolio after executing trading decisions."""
+    updated_portfolio = portfolio.copy()
+    for token, decision in trading_decisions.items():
+        if decision["action"] == "buy":
+            updated_portfolio["tokens"][token] += decision["quantity"]
+            updated_portfolio["cash"] -= decision["quantity"] * token_metrics[token].price
+        elif decision["action"] == "sell":
+            updated_portfolio["tokens"][token] -= decision["quantity"]
+            updated_portfolio["cash"] += decision["quantity"] * token_metrics[token].price
+    updated_portfolio["total_value"] = updated_portfolio["cash"]
+    for token, quantity in updated_portfolio["tokens"].items():
+        if quantity > 0:
+            updated_portfolio["total_value"] += quantity * token_metrics[token].price
+    return updated_portfolio
+
+def generate_portfolio_recommendations(
+    risk_assessments: Dict[str, Any],
+    portfolio: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Generate portfolio recommendations based on risk assessments."""
+    recommendations = {}
+    for token, assessment in risk_assessments.items():
+        max_position = assessment["max_position_size"]
+        current_position = portfolio["tokens"].get(token, 0)
+        if current_position > max_position:
+            recommendations[token] = {
+                "action": "reduce",
+                "quantity": current_position - max_position
+            }
+        elif current_position < max_position:
+            recommendations[token] = {
+                "action": "increase",
+                "quantity": max_position - current_position
+            }
+        else:
+            recommendations[token] = {
+                "action": "hold",
+                "quantity": 0
+            }
+    return recommendations
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Run crypto trading system')
+    parser.add_argument(
+        '--trading_pairs',
+        type=str,
+        nargs='+',
+        help='List of trading pairs (e.g., SOL BONK JUP)'
+    )
+    parser.add_argument(
+        '--initial_capital',
+        type=float,
+        default=10000,
+        help='Initial capital in USDC'
+    )
+    parser.add_argument(
+        '--show_reasoning',
+        action='store_true',
+        help='Show detailed agent reasoning'
+    )
+    
+    args = argparse.ArgumentParser()
+    
+    # Initialize and run trading system
+    trading_system = CryptoTradingSystem(
+        trading_pairs=args.trading_pairs,
+        initial_capital=args.initial_capital,
         show_reasoning=args.show_reasoning
     )
-    print("\nFinal Result:")
-    print(result)
+    
+    asyncio.run(trading_system.run_trading_cycle())
