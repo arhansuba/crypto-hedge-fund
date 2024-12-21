@@ -5,20 +5,13 @@ from decimal import Decimal
 import json
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
+import aiohttp
 from dotenv import load_dotenv
 
-from config import Config
-from tools import CryptoDataTools, CryptoTechnicalAnalysis, LiquidityAnalysis
 from llm_client import GaiaLLM
 from tools import MarketAnalyzer
-from executors.jupiter import JupiterExecutor
-
-# Import LLM providers
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-from langchain_groq import ChatGroq
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,170 +37,413 @@ class AgentState:
     wins: int = 0
     losses: int = 0
 
-class ChainAgnosticAgent:
-    def __init__(
+class JupiterClient:
+    """Jupiter Protocol API client."""
+    
+    def __init__(self, api_version: str = "v6"):
+        self.base_url = f"https://quote-api.jup.ag/{api_version}"
+        self.session = None
+        
+    async def ensure_session(self):
+        """Ensure aiohttp session is initialized."""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+
+    async def get_quote(
         self,
-        chains: List[str],
-        llm_provider: str = "openai",
-        trading_pairs: Optional[Dict[str, List[str]]] = None,
-        initial_capital: float = 10000
-    ):
-        # Load configurations
-        self.config = Config()
-        self.trading_config = self.config.get_trading_config()
-        
-        # Initialize chain configs
-        self.chains = {
-            chain: self.config.get_chain_config(chain)
-            for chain in chains
-        }
-        
-        # Set up LLM
-        llm_config = self.config.get_llm_config(llm_provider)
-        if not llm_config or not llm_config.api_key:
-            raise ValueError(f"Missing API key for {llm_provider}")
-            
-        self.llm = self._initialize_llm(llm_config)
-        
-        # Initialize tools for each chain
-        self.tools = {
-            chain: {
-                'data': CryptoDataTools(chain_config.rpc_url),
-                'analysis': CryptoTechnicalAnalysis(),
-                'liquidity': LiquidityAnalysis()
-            }
-            for chain, chain_config in self.chains.items()
-        }
-        
-        # Set trading pairs per chain
-        self.trading_pairs = trading_pairs or {chain: [] for chain in chains}
-        self.initial_capital = initial_capital
-
-    def _initialize_llm(self, llm_config):
-        """Initialize the appropriate LLM based on provider."""
-        if llm_config.provider == "openai":
-            return ChatOpenAI(
-                model=llm_config.model,
-                api_key=llm_config.api_key,
-                temperature=llm_config.temperature
-            )
-        elif llm_config.provider == "anthropic":
-            return ChatAnthropic(
-                model=llm_config.model,
-                api_key=llm_config.api_key,
-                temperature=llm_config.temperature
-            )
-        elif llm_config.provider == "groq":
-            return ChatGroq(
-                model=llm_config.model,
-                api_key=llm_config.api_key,
-                temperature=llm_config.temperature
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {llm_config.provider}")
-
-    async def analyze_market(self, chain_id: str, token: str):
-        """Analyze market conditions for a specific token on a chain."""
-        chain_tools = self.tools[chain_id]
-        
-        # Get market data
-        metrics = await chain_tools['data'].get_token_metrics(token)
-        history = await chain_tools['data'].get_historical_prices(
-            token,
-            limit=100
-        )
-        liquidity = await chain_tools['liquidity'].analyze_pool_depth(
-            token,
-            self.chains[chain_id].native_token,
-            ""  # pool address if needed
-        )
-        
-        # Perform technical analysis
-        analysis = chain_tools['analysis'].analyze_token(
-            history,
-            metrics,
-            liquidity
-        )
-        
-        return {
-            'metrics': metrics,
-            'analysis': analysis,
-            'liquidity': liquidity
-        }
-
-    async def generate_trade_signals(self) -> List[TradeSignal]:
-        """Generate trade signals for all tokens across all chains."""
-        signals = []
-        
-        for chain_id, tokens in self.trading_pairs.items():
-            for token in tokens:
-                # Analyze market
-                analysis = await self.analyze_market(chain_id, token)
-                
-                # Generate signal using LLM
-                signal = await self._generate_signal_with_llm(
-                    chain_id,
-                    token,
-                    analysis
-                )
-                
-                if signal:
-                    signals.append(signal)
-        
-        return signals
-
-    async def _generate_signal_with_llm(
-        self,
-        chain_id: str,
-        token: str,
-        analysis: Dict
-    ) -> Optional[TradeSignal]:
-        """Use LLM to generate trading signal from analysis."""
-        prompt = self._create_analysis_prompt(chain_id, token, analysis)
-        response = await self.llm.ainvoke(prompt)
-        
+        input_mint: str,
+        output_mint: str,
+        amount: int,
+        slippage_bps: int = 50,
+        swap_mode: str = "ExactIn",
+        only_direct_routes: bool = False,
+        restrict_intermediate_tokens: bool = True
+    ) -> Dict:
+        """Get a swap quote from Jupiter."""
         try:
-            signal_data = self._parse_llm_response(response.content)
-            return TradeSignal(
-                chain_id=chain_id,
-                token=token,
-                action=signal_data['action'],
-                quantity=signal_data['quantity'],
-                price=analysis['metrics'].price,
-                confidence=signal_data['confidence'],
-                reasoning=signal_data['reasoning']
-            )
+            await self.ensure_session()
+            
+            url = f"{self.base_url}/quote"
+            params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount),
+                "slippageBps": slippage_bps,
+                "swapMode": swap_mode,
+                "onlyDirectRoutes": only_direct_routes,
+                "restrictIntermediateTokens": restrict_intermediate_tokens
+            }
+            
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"Successfully got quote for {input_mint} -> {output_mint}")
+                    return data
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Jupiter quote error: {response.status} - {error_text}")
+                    return {}
+                    
         except Exception as e:
-            print(f"Error parsing LLM response for {token}: {e}")
+            logger.error(f"Error getting Jupiter quote: {e}")
+            return {}
+
+    async def get_swap_instruction(
+        self,
+        quote_response: Dict,
+        user_public_key: str,
+        wrap_unwrap_sol: bool = True,
+        use_shared_accounts: bool = True,
+        compute_unit_price_micro_lamports: Optional[int] = None
+    ) -> Dict:
+        """Get swap instructions from Jupiter."""
+        try:
+            await self.ensure_session()
+            
+            url = f"{self.base_url}/swap-instructions"
+            payload = {
+                "userPublicKey": user_public_key,
+                "wrapAndUnwrapSol": wrap_unwrap_sol,
+                "useSharedAccounts": use_shared_accounts,
+                "quoteResponse": quote_response
+            }
+            
+            if compute_unit_price_micro_lamports:
+                payload["computeUnitPriceMicroLamports"] = compute_unit_price_micro_lamports
+            
+            async with self.session.post(url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info("Successfully got swap instructions")
+                    return data
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Jupiter swap instruction error: {response.status} - {error_text}")
+                    return {}
+                    
+        except Exception as e:
+            logger.error(f"Error getting swap instructions: {e}")
+            return {}
+
+    async def get_price(
+        self,
+        input_mint: str,
+        output_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        amount: int = 1_000_000  # 1 unit of input token
+    ) -> Optional[Decimal]:
+        """Get token price in terms of USDC."""
+        try:
+            quote = await self.get_quote(
+                input_mint=input_mint,
+                output_mint=output_mint,
+                amount=amount
+            )
+            
+            if quote and 'outAmount' in quote:
+                price = Decimal(quote['outAmount']) / Decimal(amount)
+                return price
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting price: {e}")
             return None
 
-    def _create_analysis_prompt(self, chain_id: str, token: str, analysis: Dict) -> str:
-        """Create prompt for LLM analysis."""
-        return f"""Analyze the following market data for {token} on {chain_id}:
+    async def get_market_depth(
+        self,
+        input_mint: str,
+        output_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        test_sizes: list = [1000, 10000, 100000, 1000000]  # USDC amounts
+    ) -> Dict:
+        """Get market depth by testing different trade sizes."""
+        depth_data = {}
+        
+        for size in test_sizes:
+            try:
+                quote = await self.get_quote(
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount=size,
+                    swap_mode="ExactOut"
+                )
+                
+                if quote:
+                    depth_data[size] = {
+                        'price': Decimal(quote['inAmount']) / Decimal(size),
+                        'price_impact': float(quote.get('priceImpactPct', 0))
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Error getting depth for size {size}: {e}")
+                continue
+                
+        return depth_data
 
-Technical Analysis:
-{analysis['analysis']}
+    async def close(self):
+        """Close the client session."""
+        if self.session:
+            await self.session.close()
+            self.session = None
 
-Market Metrics:
-Price: {analysis['metrics'].price}
-Volume: {analysis['metrics'].volume}
-Liquidity: {analysis['liquidity']}
+class JupiterExecutor:
+    """Jupiter Protocol trade execution handler."""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.base_url = "https://quote-api.jup.ag/v6"
+        self.session = None
+        self.slippage_bps = self.config.get('slippage_bps', 50)  # 0.5%
+        self.max_retries = self.config.get('max_retries', 3)
+        
+    async def ensure_session(self):
+        """Ensure aiohttp session is initialized."""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
 
-Generate a trading signal with the following format:
-{{
-    "action": "BUY" or "SELL" or "HOLD",
-    "quantity": float (amount to trade),
-    "confidence": float (0-1),
-    "reasoning": string (explanation)
-}}"""
+    async def close(self):
+        """Close the session."""
+        if self.session:
+            await self.session.close()
+            self.session = None
 
-    def _parse_llm_response(self, response: str) -> Dict:
-        """Parse LLM response into structured data."""
-        import json
+    async def execute_trade(
+        self,
+        input_token: str,
+        output_token: str,
+        amount: Union[int, float, str],
+        user_public_key: str,
+        exact_out: bool = False
+    ) -> Dict:
+        """Execute a trade through Jupiter."""
         try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            raise ValueError("Failed to parse LLM response as JSON")
+            await self.ensure_session()
+            
+            # Get quote
+            quote = await self.get_quote(
+                input_token=input_token,
+                output_token=output_token,
+                amount=str(amount),
+                slippage_bps=self.slippage_bps,
+                exact_out=exact_out
+            )
+            
+            if not quote:
+                raise Exception("Failed to get quote")
+                
+            # Get swap transaction
+            swap_tx = await self.get_swap_transaction(
+                quote_response=quote,
+                user_public_key=user_public_key
+            )
+            
+            if not swap_tx:
+                raise Exception("Failed to get swap transaction")
+                
+            # Execute swap
+            result = await self.execute_swap(swap_tx)
+            
+            return {
+                'success': True,
+                'input_token': input_token,
+                'output_token': output_token,
+                'amount_in': amount,
+                'amount_out': quote['outAmount'],
+                'price_impact': quote.get('priceImpactPct', '0'),
+                'tx_hash': result.get('txid'),
+                'executed_price': Decimal(quote['outAmount']) / Decimal(amount)
+            }
+            
+        except Exception as e:
+            logger.error(f"Trade execution failed: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'input_token': input_token,
+                'output_token': output_token,
+                'amount_in': amount
+            }
+
+    async def get_quote(
+        self,
+        input_token: str,
+        output_token: str,
+        amount: str,
+        slippage_bps: int = 50,
+        exact_out: bool = False
+    ) -> Optional[Dict]:
+        """Get quote from Jupiter."""
+        try:
+            params = {
+                'inputMint': input_token,
+                'outputMint': output_token,
+                'amount': amount,
+                'slippageBps': slippage_bps,
+                'swapMode': 'ExactOut' if exact_out else 'ExactIn'
+            }
+            
+            async with self.session.get(f"{self.base_url}/quote", params=params) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Quote error: {error_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error getting quote: {e}")
+            return None
+
+    async def get_swap_transaction(
+        self,
+        quote_response: Dict,
+        user_public_key: str
+    ) -> Optional[Dict]:
+        """Get swap transaction from Jupiter."""
+        try:
+            payload = {
+                'quoteResponse': quote_response,
+                'userPublicKey': user_public_key,
+                'wrapUnwrapSOL': True,
+                'useSharedAccounts': True,
+                'dynamicComputeUnitLimit': True,
+                'prioritizationFeeLamports': 'auto'
+            }
+            
+            async with self.session.post(
+                f"{self.base_url}/swap",
+                json=payload
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Swap transaction error: {error_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error getting swap transaction: {e}")
+            return None
+
+    async def execute_swap(self, swap_tx: Dict) -> Dict:
+        """Execute swap transaction with retry logic."""
+        for attempt in range(self.max_retries):
+            try:
+                # Simulate execution (replace with actual blockchain submission)
+                tx_hash = "simulated_tx_hash"  # Replace with actual submission
+                
+                return {
+                    'success': True,
+                    'txid': tx_hash,
+                    'attempt': attempt + 1
+                }
+                
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Max retries reached for swap execution: {e}")
+                    raise
+                    
+                wait_time = 2 ** attempt  # Exponential backoff
+                logger.warning(f"Retry {attempt + 1}/{self.max_retries} in {wait_time}s")
+                await asyncio.sleep(wait_time)
+
+    async def check_transaction_status(self, tx_hash: str) -> Dict:
+        """Check status of a submitted transaction."""
+        try:
+            # Replace with actual transaction status check
+            return {
+                'status': 'confirmed',
+                'confirmations': 32,
+                'slot': 123456789
+            }
+        except Exception as e:
+            logger.error(f"Error checking transaction status: {e}")
+            return {
+                'status': 'unknown',
+                'error': str(e)
+            }
+
+    async def simulate_swap(
+        self,
+        input_token: str,
+        output_token: str,
+        amount: str,
+        user_public_key: str
+    ) -> Dict:
+        """Simulate swap to estimate costs and outcomes."""
+        try:
+            # Get quote first
+            quote = await self.get_quote(
+                input_token=input_token,
+                output_token=output_token,
+                amount=amount
+            )
+            
+            if not quote:
+                raise Exception("Failed to get quote for simulation")
+                
+            # Get swap transaction
+            swap_tx = await self.get_swap_transaction(
+                quote_response=quote,
+                user_public_key=user_public_key
+            )
+            
+            if not swap_tx:
+                raise Exception("Failed to get swap transaction for simulation")
+                
+            return {
+                'success': True,
+                'input_amount': amount,
+                'output_amount': quote['outAmount'],
+                'price_impact': quote.get('priceImpactPct', '0'),
+                'minimum_output': quote.get('otherAmountThreshold', '0'),
+                'estimated_fees': {
+                    'network': swap_tx.get('prioritizationFeeLamports', 0),
+                    'platform': quote.get('platformFee', {'amount': '0'})['amount']
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Simulation failed: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+    def _validate_amounts(
+        self,
+        amount_in: Union[int, float, str],
+        min_amount: Union[int, float, str]
+    ) -> bool:
+        """Validate trade amounts."""
+        try:
+            amount_in_dec = Decimal(str(amount_in))
+            min_amount_dec = Decimal(str(min_amount))
+            
+            if amount_in_dec <= 0 or min_amount_dec <= 0:
+                return False
+                
+            if min_amount_dec > amount_in_dec:
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
+
+class MemoryState:
+    """Memory state management for the agent."""
+    def __init__(self, size: int = 1000):
+        self.size = size
+        self.memory = []
+
+    async def add(self, entry: Dict):
+        """Add a new entry to memory."""
+        if len(self.memory) >= self.size:
+            self.memory.pop(0)  # Remove the oldest entry if memory is full
+        self.memory.append(entry)
+
+    def get_recent(self, n: int = 5) -> List[Dict]:
+        """Get the most recent n entries from memory."""
+        return self.memory[-n:]
 
 class AutoHedgeFund:
     """Autonomous hedge fund agent using GaiaNet LLM."""
@@ -237,8 +473,7 @@ class AutoHedgeFund:
         self.executor = JupiterExecutor()
         
         # Memory system
-        self.memory = []
-        self.max_memory = 1000
+        self.memory = MemoryState(size=1000)
         
     async def initialize(self):
         """Initialize and validate components."""
@@ -253,7 +488,7 @@ class AutoHedgeFund:
                     logger.warning(f"Could not get price for {pair}")
             
             # Initialize memory with market state
-            await self._update_memory({
+            await self.memory.add({
                 'type': 'initialization',
                 'timestamp': datetime.now().isoformat(),
                 'trading_pairs': self.trading_pairs,
@@ -278,7 +513,7 @@ class AutoHedgeFund:
                 
                 # Analyze market
                 analysis = await self.analyze_market()
-                await self._update_memory({
+                await self.memory.add({
                     'type': 'analysis',
                     'data': analysis,
                     'timestamp': datetime.now().isoformat()
@@ -323,30 +558,6 @@ class AutoHedgeFund:
                 
         return True
 
-    async def _update_memory(self, data: Dict):
-        """Update agent's memory system."""
-        self.memory.append(data)
-        
-        # Trim memory if needed
-        if len(self.memory) > self.max_memory:
-            self.memory = self.memory[-self.max_memory:]
-
-    def _get_relevant_memories(self, context: str, limit: int = 5) -> List[Dict]:
-        """Get relevant memories for current context."""
-        # Simple relevance scoring
-        scored_memories = []
-        for memory in self.memory:
-            score = 0
-            if memory['type'] == context:
-                score += 2
-            if 'data' in memory:
-                score += 1
-            scored_memories.append((score, memory))
-            
-        # Return top memories
-        sorted_memories = sorted(scored_memories, key=lambda x: x[0], reverse=True)
-        return [m[1] for m in sorted_memories[:limit]]
-
     def _calculate_sleep_time(self, analysis: Dict) -> int:
         """Calculate adaptive sleep time based on market conditions."""
         base_time = self.min_trade_interval
@@ -362,7 +573,7 @@ class AutoHedgeFund:
 
     async def _handle_error(self, error: Exception):
         """Handle errors and adjust strategy."""
-        await self._update_memory({
+        await self.memory.add({
             'type': 'error',
             'error': str(error),
             'timestamp': datetime.now().isoformat()
