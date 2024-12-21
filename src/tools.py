@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from decimal import Decimal
-from .jupiter_client import JupiterClient
+from .executors.jupiter_client import JupiterClient
 
 logger = logging.getLogger(__name__)
 
