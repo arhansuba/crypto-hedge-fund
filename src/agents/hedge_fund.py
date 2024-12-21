@@ -1,97 +1,204 @@
 # src/agents/hedge_fund.py
-from typing import Dict, List
-from datetime import datetime
 import logging
-from decimal import Decimal
+from typing import Dict, List, Optional
+from datetime import datetime
 
-from agents.base import BaseAgent
-from executors.jupiter import JupiterExecutor
-from tools import MarketAnalyzer
+from .base import BaseAgent
+from tools import CryptoDataTools
+from executors.jupiter_client import JupiterClient
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MARKET_DATA = {
+    'price': 0.0,
+    'volume': 0.0,
+    'liquidity': 0.0,
+    'holders': 0,
+    'transactions': 0,
+    'error': 'Using default data due to API error'
+}
+
 class HedgeFundAgent(BaseAgent):
-    """Autonomous hedge fund agent with advanced trading capabilities."""
+    """Autonomous hedge fund agent."""
     
     def __init__(
         self,
-        llm_config: Dict,
         initial_capital: float,
+        trading_pairs: List[str],
         risk_tolerance: float = 0.7,
-        max_position_size: float = 0.2,  # 20% of portfolio
-        chains: List[str] = ['solana']
+        llm_config: Optional[Dict] = None
     ):
-        super().__init__(
-            llm_config=llm_config,
-            objectives=[
-                "Maximize risk-adjusted returns",
-                "Maintain portfolio diversification",
-                "Control downside risk",
-                "Adapt to market conditions"
-            ]
-        )
+        super().__init__(llm_config)
+        self.initial_capital = initial_capital
+        self.trading_pairs = trading_pairs
+        self.risk_tolerance = risk_tolerance
         
+        # Initialize components
+        self.data_tools = CryptoDataTools()
+        self.jupiter = JupiterClient()
+        
+        # Portfolio state
         self.portfolio = {
             'cash': initial_capital,
             'positions': {},
             'total_value': initial_capital
         }
         
-        self.risk_params = {
-            'tolerance': risk_tolerance,
-            'max_position_size': max_position_size
-        }
-        
-        # Initialize components
-        self.market = MarketAnalyzer()
-        self.executor = JupiterExecutor()
-        
     async def analyze_market(self, tokens: List[str]) -> Dict:
-        """Analyze market conditions and generate trading insights."""
-        # Gather market data
-        market_data = await self.market.get_token_metrics(tokens)
+        """Analyze market conditions for given tokens."""
+        market_data = {}
         
-        # Generate market thoughts
-        thought = await self.think({
+        # Process each token individually
+        for token in tokens:
+            try:
+                # Get market data
+                metrics = await self.data_tools.get_token_metrics(token)
+                
+                market_data[token] = {
+                    'price': metrics.price if hasattr(metrics, 'price') else 0.0,
+                    'volume': metrics.volume if hasattr(metrics, 'volume') else 0.0,
+                    'liquidity': metrics.liquidity if hasattr(metrics, 'liquidity') else 0.0,
+                    'holders': metrics.holders if hasattr(metrics, 'holders') else 0,
+                    'transactions': metrics.transactions if hasattr(metrics, 'transactions') else 0
+                }
+            except Exception as e:
+                logger.error(f"Error getting metrics for {token}: {e}")
+                market_data[token] = DEFAULT_MARKET_DATA.copy()
+        
+        # Generate thought about market conditions
+        analysis = await self.think({
             'type': 'market_analysis',
             'data': market_data,
-            'portfolio': self.portfolio
-        })
-        
-        # Generate trade ideas
-        trades = await self._generate_trades(thought, market_data)
-        
-        return {
-            'analysis': thought,
-            'trades': trades,
+            'portfolio': self.portfolio,
             'timestamp': datetime.now().isoformat()
+        })
+
+        result = {
+            'market_data': market_data,
+            'analysis': analysis.get('thought', ''),
+            'timestamp': datetime.now().isoformat(),
+            'trades': []  # Initialize empty trades list
         }
+
+        # Try to generate trades from analysis
+        try:
+            trades = await self.generate_trades_from_analysis(result)
+            result['trades'] = trades
+        except Exception as e:
+            logger.error(f"Error generating trades: {e}")
+            result['trades'] = []
+
+        return result
+
+    async def generate_trades_from_analysis(self, analysis: Dict) -> List[Dict]:
+        """Generate trades based on market analysis."""
+        trades = []
+        
+        for token, data in analysis['market_data'].items():
+            if data.get('error'):
+                continue  # Skip tokens with errors
+
+            # Default conservative position size (1% of portfolio)
+            position_size = self.portfolio['total_value'] * 0.01
+                
+            # Simple trading logic if LLM is not available
+            if data['price'] > 0:
+                price_24h_change = data.get('price_change_24h', 0)
+                
+                if price_24h_change > 5:  # 5% up
+                    trades.append({
+                        'token': token,
+                        'action': 'sell',
+                        'amount': position_size,
+                        'confidence': 0.6,
+                        'reasoning': f"Price up {price_24h_change}% in 24h"
+                    })
+                elif price_24h_change < -5:  # 5% down
+                    trades.append({
+                        'token': token,
+                        'action': 'buy',
+                        'amount': position_size,
+                        'confidence': 0.6,
+                        'reasoning': f"Price down {price_24h_change}% in 24h"
+                    })
+                    
+        return trades
+
+    async def generate_trades(self, analysis: Dict) -> List[Dict]:
+        """Generate trading decisions based on analysis."""
+        trades = []
+        
+        for token in self.trading_pairs:
+            token_data = analysis['market_data'].get(token, {})
+            if 'error' not in token_data:
+                # Get trade decision
+                decision = await self.think({
+                    'type': 'trade_decision',
+                    'token': token,
+                    'data': token_data,
+                    'analysis': analysis['analysis'],
+                    'portfolio': self.portfolio
+                })
+                
+                if decision.get('action') in ['buy', 'sell']:
+                    trades.append({
+                        'token': token,
+                        'action': decision['action'],
+                        'amount': self.calculate_trade_size(
+                            token,
+                            decision.get('confidence', 0.5),
+                            token_data
+                        ),
+                        'confidence': decision.get('confidence', 0.5),
+                        'reasoning': decision.get('reasoning', '')
+                    })
+        
+        return trades
+        
+    def calculate_trade_size(
+        self,
+        token: str,
+        confidence: float,
+        market_data: Dict
+    ) -> float:
+        """Calculate trade size based on multiple factors."""
+        # Base position size (% of portfolio)
+        max_position = self.portfolio['total_value'] * 0.2  # 20% max position
+        
+        # Scale by confidence
+        position_size = max_position * confidence
+        
+        # Scale by liquidity
+        liquidity = market_data.get('liquidity', 0)
+        if liquidity > 0:
+            # Limit to 10% of available liquidity
+            position_size = min(position_size, liquidity * 0.1)
+        
+        # Ensure we have enough cash for buys
+        if position_size > self.portfolio['cash']:
+            position_size = self.portfolio['cash']
+        
+        return position_size
         
     async def execute_trades(self, trades: List[Dict]) -> Dict:
-        """Execute trading decisions with risk management."""
+        """Execute validated trades."""
         results = {}
         
         for trade in trades:
-            # Validate trade against risk limits
-            if not self._validate_trade(trade):
-                continue
-                
             try:
-                # Execute trade
-                result = await self.executor.execute_trade(trade)
+                # Execute trade through Jupiter
+                result = await self.jupiter.execute_trade(
+                    input_token=trade['token'],
+                    output_token='USDC',
+                    amount=trade['amount'],
+                    exact_out=trade['action'] == 'sell'
+                )
                 
-                # Update portfolio
                 if result['success']:
-                    self._update_portfolio(trade, result)
+                    # Update portfolio
+                    self.update_portfolio(trade, result)
                     
                 results[trade['token']] = result
-                
-                # Learn from execution
-                await self.learn({
-                    'type': 'trade_execution',
-                    'trade': trade,
-                    'result': result
-                })
                 
             except Exception as e:
                 logger.error(f"Trade execution error: {e}")
@@ -102,80 +209,43 @@ class HedgeFundAgent(BaseAgent):
                 
         return results
         
-    def _validate_trade(self, trade: Dict) -> bool:
-        """Validate trade against risk parameters."""
-        # Check position size
-        position_value = Decimal(trade['amount']) * Decimal(trade['price'])
-        max_position = Decimal(self.portfolio['total_value']) * Decimal(self.risk_params['max_position_size'])
-        
-        if position_value > max_position:
-            logger.warning(f"Trade exceeds max position size: {trade}")
-            return False
-            
-        # Check portfolio concentration
-        token = trade['token']
-        current_exposure = Decimal(self.portfolio['positions'].get(token, 0))
-        
-        if current_exposure + position_value > max_position:
-            logger.warning(f"Trade would exceed concentration limit: {trade}")
-            return False
-            
-        return True
-        
-    def _update_portfolio(self, trade: Dict, result: Dict):
+    def update_portfolio(self, trade: Dict, result: Dict):
         """Update portfolio after successful trade."""
         token = trade['token']
-        amount = Decimal(trade['amount'])
-        price = Decimal(result['executed_price'])
+        amount = float(trade['amount'])
+        price = float(result['executed_price'])
         
         if trade['action'] == 'buy':
             self.portfolio['cash'] -= amount * price
-            self.portfolio['positions'][token] = self.portfolio['positions'].get(token, 0) + amount
+            self.portfolio['positions'][token] = \
+                self.portfolio['positions'].get(token, 0) + amount
         else:
             self.portfolio['cash'] += amount * price
-            self.portfolio['positions'][token] = self.portfolio['positions'].get(token, 0) - amount
+            self.portfolio['positions'][token] = \
+                self.portfolio['positions'].get(token, 0) - amount
             
         # Update total value
-        self._calculate_total_value()
+        self.calculate_total_value()
         
-    def _calculate_total_value(self):
+    def calculate_total_value(self):
         """Calculate total portfolio value."""
-        total = Decimal(self.portfolio['cash'])
+        total = self.portfolio['cash']
         
         for token, amount in self.portfolio['positions'].items():
-            price = Decimal(self.market.get_current_price(token))
-            total += Decimal(amount) * price
-            
-        self.portfolio['total_value'] = float(total)
-        
-    async def _generate_trades(self, thought: Dict, market_data: Dict) -> List[Dict]:
-        """Generate trade decisions based on market analysis."""
-        trades = []
-        
-        for action in thought.get('actions', []):
-            if action.get('type') == 'trade':
-                trade = {
-                    'token': action['token'],
-                    'action': action['direction'],  # buy/sell
-                    'amount': self._calculate_position_size(
-                        action['token'],
-                        action.get('confidence', 0.5),
-                        market_data
-                    ),
-                    'price': market_data[action['token']]['price'],
-                    'reason': action.get('reasoning', '')
-                }
-                trades.append(trade)
+            # Get current price
+            try:
+                price = float(self.get_current_price(token))
+                total += amount * price
+            except Exception as e:
+                logger.error(f"Error getting price for {token}: {e}")
                 
-        return trades
+        self.portfolio['total_value'] = total
         
-    def _calculate_position_size(self, token: str, confidence: float, market_data: Dict) -> float:
-        """Calculate optimal position size based on confidence and risk parameters."""
-        max_position = float(Decimal(self.portfolio['total_value']) * 
-                           Decimal(self.risk_params['max_position_size']))
-                           
-        # Scale by confidence and market liquidity
-        liquidity_factor = min(1.0, market_data[token]['liquidity'] / max_position)
-        size = max_position * confidence * liquidity_factor * self.risk_params['tolerance']
-        
-        return size
+    async def get_current_price(self, token: str) -> float:
+        """Get current token price."""
+        try:
+            price = await self.jupiter.get_price(token)
+            return float(price) if price else 0.0
+        except Exception as e:
+            logger.error(f"Error getting price for {token}: {e}")
+            return 0.0

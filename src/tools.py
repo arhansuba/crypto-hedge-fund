@@ -1,12 +1,13 @@
 # src/tools.py
 import os
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from dataclasses import dataclass
 import aiohttp
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
-from .executors.jupiter_client import JupiterClient
+from executors.jupiter_client import JupiterClient
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,143 @@ class CryptoMetrics:
     transactions: int
     circulating_supply: float
     total_supply: float
+
+class MarketAnalyzer:
+    """Market analysis tools for crypto trading."""
+    
+    def __init__(self):
+        self.data_tools = CryptoDataTools()
+        
+    async def get_token_metrics(self, token: str) -> Dict:
+        """Get comprehensive token metrics with analysis."""
+        try:
+            # Get base metrics
+            metrics = await self.data_tools.get_token_metrics(token)
+            
+            # Get historical data
+            history = await self.data_tools.get_historical_prices(token)
+            
+            # Perform technical analysis
+            analysis = self.analyze_market_data(history, metrics)
+            
+            return {
+                'metrics': metrics.__dict__,
+                'analysis': analysis,
+                'timestamp': datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing token {token}: {e}")
+            return {
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    def analyze_market_data(
+        self,
+        history: pd.DataFrame,
+        metrics: CryptoMetrics
+    ) -> Dict:
+        """Perform technical analysis on market data."""
+        analysis = {}
+        
+        # Calculate price trends
+        if not history.empty:
+            analysis['price_trends'] = {
+                'sma_20': float(history['price'].rolling(20).mean().iloc[-1]),
+                'sma_50': float(history['price'].rolling(50).mean().iloc[-1]),
+                'current_price': float(history['price'].iloc[-1]),
+                'price_change_24h': self.calculate_price_change(history)
+            }
+            
+            # Add momentum indicators
+            analysis['momentum'] = {
+                'rsi': self.calculate_rsi(history['price']),
+                'macd': self.calculate_macd(history['price']),
+                'volatility': self.calculate_volatility(history['price'])
+            }
+        
+        # Add market health metrics
+        analysis['market_health'] = {
+            'liquidity_ratio': metrics.liquidity / metrics.volume if metrics.volume > 0 else 0,
+            'holder_concentration': self.calculate_holder_concentration(metrics),
+            'volume_stability': self.calculate_volume_stability(history) if not history.empty else 0
+        }
+        
+        return analysis
+    
+    def calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
+        """Calculate Relative Strength Index."""
+        try:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return float(rsi.iloc[-1])
+        except Exception:
+            return 50.0  # Neutral RSI on error
+            
+    def calculate_macd(
+        self,
+        prices: pd.Series,
+        fast_period: int = 12,
+        slow_period: int = 26
+    ) -> Dict[str, float]:
+        """Calculate MACD indicators."""
+        try:
+            exp1 = prices.ewm(span=fast_period, adjust=False).mean()
+            exp2 = prices.ewm(span=slow_period, adjust=False).mean()
+            macd = exp1 - exp2
+            signal = macd.ewm(span=9, adjust=False).mean()
+            
+            return {
+                'macd': float(macd.iloc[-1]),
+                'signal': float(signal.iloc[-1]),
+                'histogram': float(macd.iloc[-1] - signal.iloc[-1])
+            }
+        except Exception:
+            return {'macd': 0, 'signal': 0, 'histogram': 0}
+            
+    def calculate_volatility(self, prices: pd.Series, window: int = 20) -> float:
+        """Calculate price volatility."""
+        try:
+            returns = prices.pct_change()
+            return float(returns.std() * np.sqrt(window))
+        except Exception:
+            return 0.0
+            
+    def calculate_price_change(self, history: pd.DataFrame) -> float:
+        """Calculate 24-hour price change percentage."""
+        try:
+            if len(history) >= 24:
+                current_price = history['price'].iloc[-1]
+                past_price = history['price'].iloc[-24]
+                return ((current_price - past_price) / past_price) * 100
+            return 0.0
+        except Exception:
+            return 0.0
+            
+    def calculate_holder_concentration(self, metrics: CryptoMetrics) -> float:
+        """Calculate holder concentration metric."""
+        try:
+            # Simplified concentration metric
+            if metrics.circulating_supply > 0:
+                return metrics.holders / metrics.circulating_supply
+            return 0.0
+        except Exception:
+            return 0.0
+            
+    def calculate_volume_stability(self, history: pd.DataFrame) -> float:
+        """Calculate volume stability metric."""
+        try:
+            if 'volume' in history.columns:
+                volume_std = history['volume'].std()
+                volume_mean = history['volume'].mean()
+                return 1 - (volume_std / volume_mean) if volume_mean > 0 else 0
+            return 0.0
+        except Exception:
+            return 0.0
 
 class CryptoDataTools:
     def __init__(self, rpc_url: Optional[str] = None, config: Optional[Dict] = None):
@@ -42,6 +180,8 @@ class CryptoDataTools:
 
     async def get_token_metrics(self, token: str) -> CryptoMetrics:
         """Get comprehensive token metrics."""
+        
+        
         try:
             # Get price and market data from Jupiter
             price = await self.jupiter.get_price(token)

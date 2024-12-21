@@ -281,7 +281,7 @@ class CryptoBacktester:
 if __name__ == "__main__":
     import argparse
     from tools import CryptoDataTools  # Updated import statement
-    from agents import Agent  # Import the Agent class
+    from agents import HedgeFundAgent as Agent  # Import the Agent class
     
     parser = argparse.ArgumentParser(description='Run crypto backtesting simulation')
     parser.add_argument(

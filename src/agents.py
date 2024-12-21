@@ -67,15 +67,15 @@ class JupiterClient:
             params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
-                "amount": str(amount),
-                "slippageBps": slippage_bps,
+                "amount": str(amount),  # Ensure amount is a string
+                "slippageBps": str(slippage_bps),  # Ensure slippage_bps is a string
                 "swapMode": swap_mode,
-                "onlyDirectRoutes": only_direct_routes,
-                "restrictIntermediateTokens": restrict_intermediate_tokens
+                "onlyDirectRoutes": str(only_direct_routes).lower(),  # Convert to string
+                "restrictIntermediateTokens": str(restrict_intermediate_tokens).lower()  # Convert to string
             }
             
             async with self.session.get(url, params=params) as response:
-                if response.status == 200:
+                if (response.status == 200):
                     data = await response.json()
                     logger.info(f"Successfully got quote for {input_mint} -> {output_mint}")
                     return data
@@ -455,44 +455,99 @@ async def main():
     parser.add_argument('--capital', type=float, default=10000, help='Initial capital')
     parser.add_argument('--pairs', nargs='+', default=['SOL', 'BONK'], help='Trading pairs')
     parser.add_argument('--risk', type=float, default=0.7, help='Risk tolerance (0-1)')
+    parser.add_argument('--dry-run', action='store_true', help='Run without executing trades')
+    parser.add_argument('--interval', type=int, default=60, help='Trading interval in seconds')
     
     args = parser.parse_args()
     
+    # LLM configuration
+    llm_config = {
+        "model": "Meta-Llama-3-8B-Instruct-Q5_K_M",
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+    
     # Initialize agent
-    llm_config = Config.get_llm_config("openai")
-    gaianet_config = Config.get_gaianet_config()
-    llm = GaiaLLM(config_url=gaianet_config.config_url)
-    agent = HedgeFundAgent(
-        llm_config=llm_config,
-        initial_capital=args.capital,
-        risk_tolerance=args.risk,
-        chains=args.pairs
-    )
-    
-    await agent.initialize()
-    
+    agent = None
     try:
+        agent = HedgeFundAgent(
+            initial_capital=args.capital,
+            trading_pairs=args.pairs,
+            risk_tolerance=args.risk,
+            llm_config=llm_config
+        )
+        
         while True:
-            # Analyze market
-            analysis = await agent.analyze_market(args.pairs)
-            logger.info("Market Analysis:", analysis)
-            
-            # Generate trades
-            trades = analysis['trades']
-            if trades:
-                logger.info("Generated Trades:", trades)
+            try:
+                # Analyze market
+                logger.info(f"\nAnalyzing market for {args.pairs}...")
+                analysis = await agent.analyze_market(args.pairs)
                 
-                # Execute trades
-                results = await agent.execute_trades(trades)
-                logger.info("Trade Results:", results)
-            
-            # Wait before next cycle
-            await asyncio.sleep(60)  # 1-minute cycle
-            
+                # Log market data
+                logger.info("\nMarket Analysis:")
+                for token, data in analysis['market_data'].items():
+                    logger.info(f"\n{token}:")
+                    for key, value in data.items():
+                        if key != 'error':
+                            logger.info(f"  {key}: {value}")
+                        else:
+                            logger.warning(f"  {key}: {value}")
+                
+                # Handle trades
+                trades = analysis.get('trades', [])
+                if trades:
+                    logger.info("\nGenerated Trades:")
+                    for trade in trades:
+                        logger.info(
+                            f"{trade['action'].upper()} {trade['token']}: "
+                            f"Amount: {trade.get('amount', 0):.2f}, "
+                            f"Confidence: {trade.get('confidence', 0):.2f}"
+                        )
+                    
+                    # Execute trades if not dry run
+                    if not args.dry_run:
+                        results = await agent.execute_trades(trades)
+                        
+                        logger.info("\nTrade Results:")
+                        for token, result in results.items():
+                            if result.get('success'):
+                                logger.info(
+                                    f"{token}: Success - "
+                                    f"Price: ${result.get('executed_price', 0):.4f}, "
+                                    f"Amount: {result.get('amount_out', 0):.4f}"
+                                )
+                            else:
+                                logger.warning(f"{token}: Failed - {result.get('error', 'Unknown error')}")
+                else:
+                    logger.info("\nNo trades generated this cycle")
+                
+                # Portfolio update
+                logger.info("\nPortfolio Status:")
+                logger.info(f"Cash: ${agent.portfolio['cash']:.2f}")
+                logger.info(f"Total Value: ${agent.portfolio['total_value']:.2f}")
+                logger.info("Positions:")
+                for token, amount in agent.portfolio['positions'].items():
+                    try:
+                        price = await agent.get_current_price(token)
+                        value = amount * price
+                        logger.info(f"  {token}: {amount:.4f} (${value:.2f})")
+                    except Exception as e:
+                        logger.error(f"Error getting price for {token}: {e}")
+                
+                # Wait before next cycle
+                await asyncio.sleep(args.interval)
+                
+            except Exception as e:
+                logger.error(f"Error in trading cycle: {e}")
+                await asyncio.sleep(5)  # Short sleep on error
+                
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        logger.info("\nShutting down...")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
     finally:
-        await agent.llm.close()
+        if agent:
+            await agent.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

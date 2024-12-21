@@ -1,7 +1,7 @@
 # src/llm_client.py
 import aiohttp
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import json
 from datetime import datetime
 
@@ -11,15 +11,23 @@ class GaiaLLM:
     """GaiaNet LLM client for Llama 3."""
     
     def __init__(self):
-        # Use the specific GaiaNet node URL
-        self.base_url = "https://0xe7d21e1bd35163c0bcdc6d5ea8c23f3c277f2d17.us.gaianet.network/v1"
-        self.model = "Meta-Llama-3-8B-Instruct-Q5_K_M"
+        self.api_base = "https://0xe7d21e1bd35163c0bcdc6d5ea8c23f3c277f2d17.us.gaianet.network/v1"
         self.session = None
+        self.retry_attempts = 3
+        self.default_system_message = """You are an expert crypto trading AI assistant. 
+        Analyze market data and provide clear, actionable insights. Focus on:
+        - Technical analysis
+        - Risk assessment
+        - Market sentiment
+        - Trading opportunities"""
 
     async def ensure_session(self):
-        """Initialize aiohttp session."""
+        """Initialize aiohttp session with proper headers."""
         if not self.session:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(headers={
+                "accept": "application/json",
+                "Content-Type": "application/json"
+            })
 
     async def close(self):
         """Close the session."""
@@ -27,189 +35,113 @@ class GaiaLLM:
             await self.session.close()
             self.session = None
 
-    async def generate(
-        self,
-        prompt: str,
-        max_tokens: int = 1000,
-        temperature: float = 0.7
-    ) -> str:
-        """Generate text using single prompt."""
-        messages = [
-            {"role": "system", "content": "You are an expert AI trading assistant specializing in cryptocurrency markets."},
-            {"role": "user", "content": prompt}
-        ]
-        
-        response = await self.chat(messages, temperature)
-        return response
-
-    async def chat(
+    async def chat_completion(
         self,
         messages: List[Dict[str, str]],
-        temperature: float = 0.7
-    ) -> str:
-        """Chat completion using GaiaNet node."""
+        max_tokens: int = 1000,
+        temperature: float = 0.7,
+    ) -> Dict[str, Any]:
+        """Send a chat completion request to GaiaNet node."""
         try:
             await self.ensure_session()
-
+            
+            # Ensure system message is present
+            if not any(msg.get('role') == 'system' for msg in messages):
+                messages.insert(0, {
+                    "role": "system",
+                    "content": self.default_system_message
+                })
+            
             payload = {
-                "model": self.model,
                 "messages": messages,
+                "max_tokens": max_tokens,
                 "temperature": temperature,
-                "max_tokens": 1000
+                "model": "Meta-Llama-3-8B-Instruct-Q5_K_M"
             }
-
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-
-            async with self.session.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result["choices"][0]["message"]["content"]
-                else:
-                    error_text = await response.text()
-                    logger.error(f"GaiaNet API error: {response.status} - {error_text}")
-                    raise Exception(f"GaiaNet API error: {response.status}")
+            
+            url = f"{self.api_base}/chat/completions"
+            
+            for attempt in range(self.retry_attempts):
+                try:
+                    async with self.session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        elif response.status == 404:
+                            # Fallback to simple completion if chat endpoint fails
+                            return await self._fallback_completion(messages)
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"API error: {response.status} - {error_text}")
+                            
+                            if attempt == self.retry_attempts - 1:
+                                raise Exception(f"API error: {response.status}")
+                                
+                except aiohttp.ClientError as e:
+                    if attempt == self.retry_attempts - 1:
+                        raise
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                    
+            raise Exception("Max retries exceeded")
 
         except Exception as e:
-            logger.error(f"Error in chat completion: {e}")
+            logger.error(f"Chat completion error: {e}")
             raise
 
-    async def analyze_market(self, market_data: Dict) -> Dict:
-        """Analyze market data using LLM."""
-        try:
-            prompt = self._create_market_analysis_prompt(market_data)
-            response = await self.generate(prompt, temperature=0.7)
-            return self._parse_analysis_response(response)
-        except Exception as e:
-            logger.error(f"Market analysis error: {e}")
-            return {
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
-
-    async def generate_trading_decision(
+    async def _fallback_completion(
         self,
-        analysis: Dict,
-        portfolio: Dict,
-        risk_params: Dict
-    ) -> Dict:
-        """Generate trading decision based on analysis."""
+        messages: List[Dict[str, str]]
+    ) -> Dict[str, Any]:
+        """Fallback to basic completion if chat fails."""
         try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are an expert crypto trading AI focused on generating precise trading decisions with careful risk management."
-                },
-                {
-                    "role": "user",
-                    "content": self._create_trading_decision_prompt(analysis, portfolio, risk_params)
-                }
-            ]
+            # Combine messages into a single prompt
+            prompt = "\n".join(msg['content'] for msg in messages)
             
-            response = await self.chat(messages, temperature=0.5)
-            return self._parse_trading_decision(response)
+            url = f"{self.api_base}/completions"
             
+            payload = {
+                "prompt": prompt,
+                "max_tokens": 1000,
+                "temperature": 0.7,
+                "model": "Meta-Llama-3-8B-Instruct-Q5_K_M"
+            }
+            
+            async with self.session.post(url, json=payload) as response:
+                if response.status == 200:
+                    completion = await response.json()
+                    # Convert to chat format
+                    return {
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": completion['choices'][0]['text']
+                            }
+                        }]
+                    }
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Fallback completion error: {response.status} - {error_text}")
+                    raise Exception(f"Fallback completion failed: {response.status}")
+
         except Exception as e:
-            logger.error(f"Trading decision generation error: {e}")
-            return {
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
-
-    def _create_market_analysis_prompt(self, market_data: Dict) -> str:
-        """Create market analysis prompt."""
-        return f"""Analyze the following market data and provide detailed insights:
-
-Market Data:
-{json.dumps(market_data, indent=2)}
-
-Provide analysis covering:
-1. Market Conditions
-2. Technical Indicators
-3. Risk Factors
-4. Trading Opportunities
-
-Format your response as JSON with the following structure:
-{{
-    "market_conditions": string,
-    "technical_analysis": {{
-        "trend": string,
-        "momentum": string,
-        "volatility": float
-    }},
-    "risks": [string],
-    "opportunities": [{{
-        "token": string,
-        "action": string,
-        "reason": string,
-        "confidence": float
-    }}],
-    "overall_sentiment": string
-}}"""
-
-    def _create_trading_decision_prompt(
-        self,
-        analysis: Dict,
-        portfolio: Dict,
-        risk_params: Dict
-    ) -> str:
-        """Create trading decision prompt."""
-        return f"""Based on the following data, generate specific trading decisions:
-
-Analysis:
-{json.dumps(analysis, indent=2)}
-
-Current Portfolio:
-{json.dumps(portfolio, indent=2)}
-
-Risk Parameters:
-{json.dumps(risk_params, indent=2)}
-
-Generate trading decisions in JSON format:
-{{
-    "trades": [
-        {{
-            "token": string,
-            "action": "buy" or "sell",
-            "size": float,
-            "price_limit": float,
-            "confidence": float,
-            "reasoning": string
-        }}
-    ],
-    "risk_assessment": {{
-        "portfolio_risk": float,
-        "market_risk": float,
-        "risk_factors": [string]
-    }}
-}}"""
-
-    def _parse_analysis_response(self, response: str) -> Dict:
-        """Parse LLM analysis response."""
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse analysis response as JSON")
-            return {
-                "error": "Invalid response format",
-                "raw_response": response,
-                "timestamp": datetime.now().isoformat()
-            }
-
-    def _parse_trading_decision(self, response: str) -> Dict:
-        """Parse LLM trading decision response."""
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse trading decision as JSON")
-            return {
-                "error": "Invalid decision format",
-                "raw_response": response,
-                "timestamp": datetime.now().isoformat()
-            }
+            logger.error(f"Fallback completion error: {e}")
+            raise
+            
+    def _validate_messages(self, messages: List[Dict[str, str]]) -> bool:
+        """Validate message format."""
+        if not messages:
+            return False
+            
+        required_keys = {'role', 'content'}
+        valid_roles = {'system', 'user', 'assistant'}
+        
+        for msg in messages:
+            if not isinstance(msg, dict):
+                return False
+            if not all(key in msg for key in required_keys):
+                return False
+            if msg['role'] not in valid_roles:
+                return False
+            if not isinstance(msg['content'], str):
+                return False
+                
+        return True
