@@ -71,7 +71,8 @@ OPENAI_API_KEY=your_openai_api_key
 Launch the trading system with specific parameters:
 
 ```bash
-python main.py --trading_pairs SOL BONK JUP --initial_capital 10000 --show_reasoning
+python src/agents.py --trading_pairs SOL BONK JUP --initial_capital 10000 --show_reasoning
+python src/agents.py --capital 10000 --pairs SOL BONK --risk 0.7 --dry-run --interval 60
 ```
 
 Command line parameters include:
