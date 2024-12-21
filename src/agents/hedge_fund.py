@@ -4,9 +4,9 @@ from datetime import datetime
 import logging
 from decimal import Decimal
 
-from .base import BaseAgent
-from ..executors.jupiter import JupiterExecutor
-from ..tools import MarketAnalyzer
+from agents.base import BaseAgent
+from executors.jupiter import JupiterExecutor
+from tools import MarketAnalyzer
 
 logger = logging.getLogger(__name__)
 

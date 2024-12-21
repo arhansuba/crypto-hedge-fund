@@ -10,7 +10,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from config import Config
-from agents import HedgeFundAgent
+from agents.hedge_fund import HedgeFundAgent
 from llm_client import GaiaLLM  # Import GaiaLLM
 
 logging.basicConfig(level=logging.INFO)
