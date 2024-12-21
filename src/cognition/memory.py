@@ -1,9 +1,7 @@
 # src/cognition/memory.py
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
-import json
-import numpy as np
-from dataclasses import dataclass, asdict
+from datetime import datetime
+from dataclasses import dataclass
 import logging
 from collections import deque
 

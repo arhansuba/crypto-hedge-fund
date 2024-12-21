@@ -31,6 +31,10 @@ class TradingConfig:
     min_confidence: float
     slippage_tolerance: float = 0.01
 
+@dataclass
+class GaiaNetConfig:
+    config_url: str
+
 class Config:
     # Chain configurations
     CHAIN_CONFIGS = {
@@ -92,6 +96,11 @@ class Config:
         }
     }
 
+    # GaiaNet configuration
+    GAIANET_CONFIG = GaiaNetConfig(
+        config_url="https://raw.gaianet.ai/llama-3-8b-instruct/config.json"
+    )
+
     @staticmethod
     def get_chain_config(chain_id: str) -> Optional[ChainConfig]:
         return Config.CHAIN_CONFIGS.get(chain_id)
@@ -112,3 +121,7 @@ class Config:
             risk_tolerance=float(os.getenv("RISK_TOLERANCE", "0.7")),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.7"))
         )
+
+    @staticmethod
+    def get_gaianet_config() -> GaiaNetConfig:
+        return Config.GAIANET_CONFIG

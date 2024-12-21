@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 async def check_jupiter_connection():
     """Test connection to Jupiter API."""
-    url = "https://api.jup.ag/v6/price"
+    url = "https://quote-api.jup.ag/v6/price"
     params = {
         "inputMint": "So11111111111111111111111111111111111111112",  # SOL
         "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
@@ -34,13 +34,34 @@ async def check_jupiter_connection():
             logger.error(f"❌ Jupiter API connection failed: {e}")
             return False
 
+async def check_gaianet_connection():
+    """Test connection to GaiaNet API."""
+    url = "https://raw.gaianet.ai/llama-3-8b-instruct/config.json"
+    
+    ssl_context = ssl.create_default_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    logger.info("✅ GaiaNet API connection successful")
+                    return True
+                else:
+                    logger.error(f"❌ GaiaNet API error: {response.status}")
+                    return False
+        except Exception as e:
+            logger.error(f"❌ GaiaNet API connection failed: {e}")
+            return False
+
 def check_environment():
     """Check if all required environment variables are set."""
     load_dotenv()
     
     required_vars = [
         "OPENAI_API_KEY",
-        "HELIUS_API_KEY"
+        "HELIUS_API_KEY",
+        "GAIANET_API_KEY"
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -58,7 +79,8 @@ async def main():
     
     checks = [
         ("Environment variables", check_environment()),
-        ("Jupiter API connection", await check_jupiter_connection())
+        ("Jupiter API connection", await check_jupiter_connection()),
+        ("GaiaNet API connection", await check_gaianet_connection())
     ]
     
     all_passed = all(result for _, result in checks)

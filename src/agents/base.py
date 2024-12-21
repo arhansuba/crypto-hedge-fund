@@ -1,6 +1,5 @@
 # src/agents/base.py
-from typing import Dict, List, Optional
-import asyncio
+from typing import Dict, List
 from datetime import datetime
 import logging
 

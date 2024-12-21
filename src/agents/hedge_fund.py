@@ -1,7 +1,6 @@
 # src/agents/hedge_fund.py
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime
-import asyncio
 import logging
 from decimal import Decimal
 
