@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from executors.jupiter_client import JupiterClient
-
+from typing import Tuple
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -280,3 +280,74 @@ class CryptoDataTools:
         except Exception as e:
             logger.error(f"Error fetching Helius metrics: {e}")
             return {}
+
+
+
+def calculate_bollinger_bands(prices_df: pd.DataFrame, window: int = 20, num_std_dev: int = 2) -> Tuple[pd.Series, pd.Series]:
+    """Calculate Bollinger Bands."""
+    rolling_mean = prices_df['close'].rolling(window=window).mean()
+    rolling_std = prices_df['close'].rolling(window=window).std()
+    upper_band = rolling_mean + (rolling_std * num_std_dev)
+    lower_band = rolling_mean - (rolling_std * num_std_dev)
+    return upper_band, lower_band
+
+def calculate_intrinsic_value(free_cash_flow: float, growth_rate: float, discount_rate: float, terminal_growth_rate: float, num_years: int) -> float:
+    """Calculate intrinsic value using Discounted Cash Flow (DCF) model."""
+    present_value = 0
+    for year in range(1, num_years + 1):
+        present_value += free_cash_flow * ((1 + growth_rate) ** year) / ((1 + discount_rate) ** year)
+    terminal_value = (free_cash_flow * (1 + growth_rate) ** num_years * (1 + terminal_growth_rate)) / (discount_rate - terminal_growth_rate)
+    intrinsic_value = present_value + terminal_value / ((1 + discount_rate) ** num_years)
+    return intrinsic_value
+
+def calculate_macd(prices_df: pd.DataFrame, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> Tuple[pd.Series, pd.Series]:
+    """Calculate MACD (Moving Average Convergence Divergence)."""
+    exp1 = prices_df['close'].ewm(span=fast_period, adjust=False).mean()
+    exp2 = prices_df['close'].ewm(span=slow_period, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=signal_period, adjust=False).mean()
+    return macd, signal
+
+def calculate_obv(prices_df: pd.DataFrame) -> pd.Series:
+    """Calculate On-Balance Volume (OBV)."""
+    obv = (np.sign(prices_df['close'].diff()) * prices_df['volume']).fillna(0).cumsum()
+    return obv
+
+def calculate_rsi(prices_df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Relative Strength Index (RSI)."""
+    delta = prices_df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def search_line_items(ticker: str, line_items: List[str], period: str = 'ttm', limit: int = 1) -> List[Dict]:
+    """Search for specific financial line items."""
+    # Placeholder implementation
+    return [{"line_item": item, "value": 1000} for item in line_items]
+
+def get_financial_metrics(ticker: str, report_period: str = 'ttm', period: str = 'ttm', limit: int = 1) -> List[Dict]:
+    """Get financial metrics for a given ticker."""
+    # Placeholder implementation
+    return [{"return_on_equity": 0.15, "net_margin": 0.20, "operating_margin": 0.15, "revenue_growth": 0.10, "earnings_growth": 0.10, "book_value_growth": 0.10, "current_ratio": 1.5, "debt_to_equity": 0.5, "free_cash_flow_per_share": 5.0, "earnings_per_share": 6.0, "price_to_earnings_ratio": 25, "price_to_book_ratio": 3, "price_to_sales_ratio": 5}]
+
+def get_insider_trades(ticker: str, end_date: str, limit: int = 5) -> List[Dict]:
+    """Get insider trades for a given ticker."""
+    # Placeholder implementation
+    return [{"transaction_shares": 1000, "transaction_price": 50.0} for _ in range(limit)]
+
+def get_market_cap(ticker: str) -> float:
+    """Get market capitalization for a given ticker."""
+    # Placeholder implementation
+    return 1000000000.0
+
+def get_prices(ticker: str, start_date: str, end_date: str) -> List[Dict]:
+    """Get historical prices for a given ticker."""
+    # Placeholder implementation
+    dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    return [{"date": date.strftime('%Y-%m-%d'), "close": 100.0, "volume": 1000} for date in dates]
+
+def prices_to_df(prices: List[Dict]) -> pd.DataFrame:
+    """Convert list of price dictionaries to DataFrame."""
+    return pd.DataFrame(prices).set_index('date')
